@@ -26,7 +26,7 @@ def estandarizar_columnas(df):
 
 @st.cache_data
 def generar_modelo_reparto_sucursal(df):
-    """Procesa el DataFrame y genera las prioridades de resurtido."""
+    """Procesa el DataFrame y genera las prioridades de resurtido evaluando primero lo local."""
     df_proc = estandarizar_columnas(df.copy())
 
     cols_numericas = [
@@ -40,27 +40,36 @@ def generar_modelo_reparto_sucursal(df):
                 df_proc[col] = df_proc[col].astype(str).str.replace(',', '').str.replace('%', '')
             df_proc[col] = pd.to_numeric(df_proc[col], errors='coerce').fillna(0)
 
-    # Reglas de negocio
+    # NUEVAS REGLAS DE NEGOCIO (Priorizando Total Existencias local)
     condiciones = [
-        (df_proc['Faltantes 0-3'] >= 1) & (df_proc['CEDIS'] > 0) & (df_proc['Dias de inventario'] <= 7),
-        (df_proc['Dias de inventario'] <= 7) & (df_proc['CEDIS'] <= 0) & (df_proc['Unidades Vendidas'] > 0),
-        (df_proc['StockSV'] >= 1) | ((df_proc['Total Existencias'] > 0) & (df_proc['Unidades Vendidas'] == 0)),
-        (df_proc['Dias de inventario'] > 60) & (df_proc['Unidades Vendidas'] > 0),
-        (df_proc['Dias de inventario'] > 7) & (df_proc['Dias de inventario'] <= 60)
+        # PRIORIDAD 1: La SUCURSAL está en quiebre (<=0) o crítica (Faltante 0-3) Y SÍ HAY stock en CEDIS. 
+        ((df_proc['Total Existencias'] <= 0) | (df_proc['Faltantes 0-3'] >= 1)) & (df_proc['CEDIS'] > 0),
+        
+        # PRIORIDAD 2: La SUCURSAL está en quiebre (<=0) o crítica, pero CEDIS TAMBIÉN está en ceros.
+        ((df_proc['Total Existencias'] <= 0) | (df_proc['Faltantes 0-3'] >= 1)) & (df_proc['CEDIS'] <= 0),
+        
+        # PRIORIDAD 3: Hay inventario físico en la sucursal, pero NO HAY VENTAS (Estancado)
+        (df_proc['Total Existencias'] > 0) & (df_proc['Unidades Vendidas'] <= 0),
+        
+        # PRIORIDAD 4: La sucursal tiene inventario sano (>3), pero la CADENA está sobrestockeada (>60 días). Frenar envíos.
+        (df_proc['Total Existencias'] > 3) & (df_proc['Dias de inventario'] > 60),
+        
+        # PRIORIDAD 5: La sucursal tiene inventario (>3) y el nivel de días global es aceptable.
+        (df_proc['Total Existencias'] > 3) & (df_proc['Dias de inventario'] <= 60)
     ]
 
     prioridades = [
         '1 - Resurtir Urgente (CEDIS -> Sucursal)',
         '2 - Alerta Quiebre (Sin Stock en CEDIS)',
         '3 - Acción Comercial Local (Stock sin Venta)',
-        '4 - Sobrestock Local (Frenar Envíos)',
+        '4 - Sobrestock (Frenar Envíos)',
         '5 - Inventario Sano'
     ]
 
     acciones = [
-        'Generar orden de reparto desde CEDIS prioritariamente a esta sucursal.',
-        'Sin stock en CEDIS; evaluar traspaso o compra.',
-        'Revisar exhibición/frenteo en piso de venta o promover.',
+        'Sucursal en quiebre. Generar orden de reparto desde CEDIS.',
+        'Sucursal en quiebre y sin stock en CEDIS; evaluar traspaso o compra.',
+        'Revisar exhibición en piso de venta; mercancía estancada.',
         'Pausar despachos a esta tienda.',
         'Mantener flujo normal de abastecimiento.'
     ]
@@ -68,8 +77,9 @@ def generar_modelo_reparto_sucursal(df):
     df_proc['Nivel_Prioridad'] = np.select(condiciones, prioridades, default='6 - Revisión Manual')
     df_proc['Accion_Recomendada'] = np.select(condiciones, acciones, default='Validar datos de origen.')
 
-    cols_orden = [c for c in ['Nivel_Prioridad', 'Sucursal', 'Dias de inventario'] if c in df_proc.columns]
-    df_proc = df_proc.sort_values(by=cols_orden, ascending=[True, True, True])
+    # Ordenar por Prioridad, luego por Sucursal y CEDIS disponible
+    cols_orden = [c for c in ['Nivel_Prioridad', 'Sucursal', 'CEDIS'] if c in df_proc.columns]
+    df_proc = df_proc.sort_values(by=cols_orden, ascending=[True, True, False])
 
     return df_proc
 
@@ -78,13 +88,11 @@ def generar_modelo_reparto_sucursal(df):
 # ==========================================
 
 st.title("📦 Modelo Predictivo de Reparto por Sucursal")
-st.markdown("Sube tu tabla semanal de detalles (CSV o Excel) para clasificar las acciones prioritarias de inventario.")
+st.markdown("Sube tu tabla semanal de detalles para clasificar las acciones prioritarias de inventario.")
 
-# 1. Componente para subir el archivo
 archivo_subido = st.file_uploader("Arrastra aquí tu archivo detallado (.csv, .xlsx)", type=['csv', 'xlsx', 'xls'])
 
 if archivo_subido is not None:
-    # Cargar el archivo según su extensión
     if archivo_subido.name.lower().endswith('.csv'):
         try:
             df_bruto = pd.read_csv(archivo_subido, encoding='utf-8')
@@ -93,13 +101,11 @@ if archivo_subido is not None:
     else:
         df_bruto = pd.read_excel(archivo_subido)
 
-    # Procesar los datos
     with st.spinner("Procesando reglas de negocio e inventario..."):
         df_resultado = generar_modelo_reparto_sucursal(df_bruto)
 
     st.success("¡Datos procesados con éxito!")
 
-    # 2. Métricas rápidas (KPIs)
     st.markdown("### 📊 Resumen de Prioridades")
     prioridad_counts = df_resultado['Nivel_Prioridad'].value_counts()
     
@@ -107,9 +113,8 @@ if archivo_subido is not None:
     col1.metric("Resurtir Urgente (P1)", prioridad_counts.get('1 - Resurtir Urgente (CEDIS -> Sucursal)', 0))
     col2.metric("Alerta Quiebre (P2)", prioridad_counts.get('2 - Alerta Quiebre (Sin Stock en CEDIS)', 0))
     col3.metric("Acción Comercial (P3)", prioridad_counts.get('3 - Acción Comercial Local (Stock sin Venta)', 0))
-    col4.metric("Sobrestock (P4)", prioridad_counts.get('4 - Sobrestock Local (Frenar Envíos)', 0))
+    col4.metric("Sobrestock (P4)", prioridad_counts.get('4 - Sobrestock (Frenar Envíos)', 0))
 
-    # 3. Filtros Interactivos
     st.markdown("### 🔍 Explorador de Recomendaciones")
     col_filtro1, col_filtro2 = st.columns(2)
     
@@ -121,15 +126,12 @@ if archivo_subido is not None:
         prioridades_unicas = list(df_resultado['Nivel_Prioridad'].unique())
         prioridades_sel = st.multiselect("Filtrar por Prioridad", prioridades_unicas, default=prioridades_unicas)
 
-    # Aplicar filtros
     df_mostrar = df_resultado[df_resultado['Nivel_Prioridad'].isin(prioridades_sel)]
     if sucursal_sel != 'Todas':
         df_mostrar = df_mostrar[df_mostrar['Sucursal'] == sucursal_sel]
 
-    # Mostrar la tabla en Streamlit
     st.dataframe(df_mostrar, use_container_width=True, hide_index=True)
 
-    # 4. Botón para Exportar a Excel
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         df_resultado.to_excel(writer, index=False, sheet_name='Recomendaciones')
