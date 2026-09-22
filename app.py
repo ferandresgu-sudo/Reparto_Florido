@@ -4,9 +4,9 @@ import numpy as np
 import io
 import requests
 
-# Configuración inicial de la página web
+# Configuración principal de la aplicación web
 st.set_page_config(
-    page_title="Modelo de Reparto Inteligente",
+    page_title="Modelo Predictivo de Reparto",
     layout="wide",
     page_icon="📦"
 )
@@ -31,7 +31,7 @@ def estandarizar_columnas(df):
 
 @st.cache_data
 def generar_modelo_reparto_sucursal(df):
-    """Procesa el DataFrame y genera las prioridades de resurtido evaluando el inventario físico local."""
+    """Procesa el DataFrame y evalúa prioridades con base en el inventario físico local."""
     df_proc = estandarizar_columnas(df.copy())
 
     cols_numericas = [
@@ -45,21 +45,21 @@ def generar_modelo_reparto_sucursal(df):
                 df_proc[col] = df_proc[col].astype(str).str.replace(',', '').str.replace('%', '')
             df_proc[col] = pd.to_numeric(df_proc[col], errors='coerce').fillna(0)
 
-    # REGLAS DE NEGOCIO (Evaluando primero el Total Existencias físico en la sucursal)
+    # REGLAS DE NEGOCIO (Priorizando el Total Existencias físico local)
     condiciones = [
-        # PRIORIDAD 1: La SUCURSAL está en quiebre (<=0) o crítica (Faltante 0-3) Y SÍ HAY stock en CEDIS. 
+        # PRIORIDAD 1: Sucursal en quiebre (<=0) o crítica (Faltante 0-3) Y SÍ HAY stock en CEDIS.
         ((df_proc['Total Existencias'] <= 0) | (df_proc['Faltantes 0-3'] >= 1)) & (df_proc['CEDIS'] > 0),
         
-        # PRIORIDAD 2: La SUCURSAL está en quiebre (<=0) o crítica, pero CEDIS TAMBIÉN está en ceros.
+        # PRIORIDAD 2: Sucursal en quiebre (<=0) o crítica, pero CEDIS TAMBIÉN está en ceros.
         ((df_proc['Total Existencias'] <= 0) | (df_proc['Faltantes 0-3'] >= 1)) & (df_proc['CEDIS'] <= 0),
         
-        # PRIORIDAD 3: Hay inventario físico en la sucursal, pero NO HAY VENTAS (Estancado)
+        # PRIORIDAD 3: Hay inventario físico en sucursal, pero NO HAY VENTAS (Estancado)
         (df_proc['Total Existencias'] > 0) & (df_proc['Unidades Vendidas'] <= 0),
         
-        # PRIORIDAD 4: La sucursal tiene inventario (>3), pero la CADENA está sobrestockeada (>60 días). Frenar envíos.
+        # PRIORIDAD 4: Inventario local sano (>3), pero la CADENA está sobrestockeada (>60 días). Frenar envíos.
         (df_proc['Total Existencias'] > 3) & (df_proc['Dias de inventario'] > 60),
         
-        # PRIORIDAD 5: La sucursal tiene inventario (>3) y el nivel de días global es aceptable.
+        # PRIORIDAD 5: Inventario local sano (>3) y la cobertura global es aceptable (<=60 días).
         (df_proc['Total Existencias'] > 3) & (df_proc['Dias de inventario'] <= 60)
     ]
 
@@ -82,40 +82,38 @@ def generar_modelo_reparto_sucursal(df):
     df_proc['Nivel_Prioridad'] = np.select(condiciones, prioridades, default='6 - Revisión Manual')
     df_proc['Accion_Recomendada'] = np.select(condiciones, acciones, default='Validar datos de origen.')
 
-    # Ordenar resultados por Prioridad, luego por Sucursal y CEDIS disponible
     cols_orden = [c for c in ['Nivel_Prioridad', 'Sucursal', 'CEDIS'] if c in df_proc.columns]
     df_proc = df_proc.sort_values(by=cols_orden, ascending=[True, True, False])
 
     return df_proc
 
-def enviar_mensaje_whapi(api_token, numero_destino, mensaje):
-    """Envía un mensaje de texto por WhatsApp usando la API de Whapi.cloud."""
-    url = "https://gate.whapi.cloud/messages/text"
+def enviar_mensaje_evolution_api(server_url, api_key, instance_name, numero_destino, mensaje):
+    """Envía un mensaje de WhatsApp a través de una instancia auto-hospedada de Evolution API."""
+    server_url = server_url.rstrip('/')
+    endpoint = f"{server_url}/message/sendText/{instance_name}"
     
     headers = {
-        "Authorization": f"Bearer {api_token}",
+        "apikey": api_key,
         "Content-Type": "application/json"
     }
     
-    # Formatear el identificador si es número personal
-    if not numero_destino.endswith("@s.whatsapp.net") and not numero_destino.endswith("@g.us"):
-        recipient = f"{numero_destino}@s.whatsapp.net"
-    else:
-        recipient = numero_destino
-
     payload = {
-        "to": recipient,
-        "body": mensaje
+        "number": numero_destino,
+        "text": mensaje,
+        "options": {
+            "delay": 1200,
+            "presence": "composing"
+        }
     }
     
     try:
-        response = requests.post(url, json=payload, headers=headers)
+        response = requests.post(endpoint, json=payload, headers=headers, timeout=15)
         if response.status_code in [200, 201]:
             return True, "Mensaje enviado exitosamente."
         else:
             return False, f"Error {response.status_code}: {response.text}"
     except Exception as e:
-        return False, f"Excepción de conexión: {str(e)}"
+        return False, f"Error de conexión: {str(e)}"
 
 # ==========================================
 # INTERFAZ DE STREAMLIT
@@ -127,7 +125,7 @@ st.markdown("Sube tu tabla semanal de detalles para clasificar las acciones prio
 archivo_subido = st.file_uploader("Arrastra aquí tu archivo detallado (.csv, .xlsx)", type=['csv', 'xlsx', 'xls'])
 
 if archivo_subido is not None:
-    # Lectura dinámica de archivos
+    # Carga de datos dinámica
     if archivo_subido.name.lower().endswith('.csv'):
         try:
             df_bruto = pd.read_csv(archivo_subido, encoding='utf-8')
@@ -169,7 +167,7 @@ if archivo_subido is not None:
 
     st.dataframe(df_mostrar, use_container_width=True, hide_index=True)
 
-    # 3. Exportar Excel
+    # 3. Exportar a Excel
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         df_resultado.to_excel(writer, index=False, sheet_name='Recomendaciones')
@@ -185,26 +183,29 @@ if archivo_subido is not None:
         type="primary"
     )
 
-    # 4. Módulo de Notificaciones por WhatsApp
+    # 4. Módulo de Notificaciones por WhatsApp (Evolution API)
     st.markdown("---")
-    st.markdown("### 📱 Enviar Alerta Automatizada por WhatsApp")
+    st.markdown("### 📱 Enviar Alerta Automatizada por WhatsApp (Servidor Gratuito)")
 
-    with st.expander("⚙️ Configurar envío de alertas a responsables"):
-        col_whapi1, col_whapi2 = st.columns(2)
+    with st.expander("⚙️ Configurar envío vía Evolution API"):
+        col_ev1, col_ev2 = st.columns(2)
         
-        with col_whapi1:
-            token_whapi = st.text_input("Whapi API Token", type="password", help="Obtenlo en tu panel de Whapi.cloud")
-        with col_whapi2:
-            telefono_destino = st.text_input("Número de WhatsApp / ID Grupo", value="521", help="Incluye clave de país. Ej. 5216641234567 para México")
+        with col_ev1:
+            url_servidor = st.text_input("URL del Servidor", value="https://tu-instancia.koyeb.app")
+            instance_name = st.text_input("Nombre de la Instancia", value="reparto_florido")
+            
+        with col_ev2:
+            api_key_server = st.text_input("API Key del Servidor", type="password")
+            telefono_destino = st.text_input("Número de WhatsApp Destino", value="5216641234567")
 
         if st.button("🚀 Enviar Resumen de Alertas Críticas (P1 y P2)", type="primary"):
-            if not token_whapi or len(telefono_destino) < 10:
-                st.warning("Ingresa un API Token válido y un número telefónico completo.")
+            if not url_servidor or not api_key_server or not instance_name or len(telefono_destino) < 10:
+                st.warning("Completa los datos del servidor y el número telefónico de destino.")
             else:
                 df_criticos = df_resultado[df_resultado['Nivel_Prioridad'].str.startswith(('1', '2'))]
                 
                 if df_criticos.empty:
-                    st.info("No hay alertas críticas (P1 o P2) para notificar en este archivo.")
+                    st.info("No hay alertas críticas (P1 o P2) para notificar.")
                 else:
                     mensaje_texto = f"🚨 REPORTE DE ALERTAS - REPARTO SECTORIAL\n"
                     mensaje_texto += f"Se detectaron {len(df_criticos)} SKU(s) en estado crítico:\n\n"
@@ -219,8 +220,14 @@ if archivo_subido is not None:
                         
                     mensaje_texto += "📌 Acción: Revisar la plataforma web para procesar órdenes."
 
-                    with st.spinner("Enviando mensaje por WhatsApp..."):
-                        exito, respuesta = enviar_mensaje_whapi(token_whapi, telefono_destino, mensaje_texto)
+                    with st.spinner("Enviando mensaje desde tu servidor de WhatsApp..."):
+                        exito, respuesta = enviar_mensaje_evolution_api(
+                            url_servidor, 
+                            api_key_server, 
+                            instance_name, 
+                            telefono_destino, 
+                            mensaje_texto
+                        )
                         
                     if exito:
                         st.success("¡Alerta enviada correctamente por WhatsApp!")
