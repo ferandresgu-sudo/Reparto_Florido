@@ -2,4 +2,5 @@ streamlit
 pandas
 numpy
 openpyxl
-requests
+scikit-learn
+lightgbm
