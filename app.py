@@ -437,78 +437,34 @@ def crecimiento_ytd(historial, ano_objetivo):
 
 
 def aplicar_ajuste_estacional(pred_base, historial, periodo):
-    """Ajuste estacional suave, sin piso rígido igual al año anterior.
-
-    Devuelve la predicción y valores de diagnóstico para verificar cuánto aportó
-    CatBoost, la referencia histórica y la tendencia YTD.
-    """
     mes = periodo % 100
     ano = periodo // 100
     indice = indice_estacional(historial, ano)
-
     mismos = historial[
-        (historial["MES_NUM"] == mes)
-        & (historial["AÑO"] < ano)
+        (historial["MES_NUM"] == mes) & (historial["AÑO"] < ano)
     ].sort_values("AÑO").tail(2)
 
-    diagnostico = {
-        "Indice_estacional": float(indice),
-        "Referencia_ultimo_ano": np.nan,
-        "Referencia_historica": np.nan,
-        "Crecimiento_YTD": 1.0,
-        "Referencia_YTD": np.nan,
-        "Prediccion_estacional": float(pred_base),
-        "Referencia_suavizada": np.nan,
-        "Ajuste_aplicado": False,
-    }
-
     if mismos.empty or indice < UMBRAL_ESTACIONAL:
-        return max(0.0, float(pred_base)), diagnostico
+        return float(pred_base)
 
     valores = mismos["VENTA"].astype(float).to_numpy()
-    ultimo_ano = float(valores[-1])
-    referencia_historica = (
-        ultimo_ano
+    referencia = (
+        valores[-1]
         if len(valores) == 1
-        else 0.65 * ultimo_ano + 0.35 * float(valores[-2])
+        else 0.65 * valores[-1] + 0.35 * valores[-2]
     )
-
     crec = crecimiento_ytd(historial, ano)
-    referencia_ytd = referencia_historica * crec
-
-    prediccion_estacional = (
-        PESO_FORECAST_ESTACIONAL * float(pred_base)
-        + (1.0 - PESO_FORECAST_ESTACIONAL) * referencia_ytd
+    referencia_ytd = referencia * crec
+    ajustada = (
+        PESO_FORECAST_ESTACIONAL * pred_base
+        + (1 - PESO_FORECAST_ESTACIONAL) * referencia_ytd
     )
+    piso = valores[-1] * (1 + 0.35 * max(crec - 1, 0))
+    return max(float(ajustada), float(piso))
 
-    # La tendencia YTD se transfiere parcialmente. Se permite que el forecast
-    # quede hasta 10% por debajo o 20% por encima del mismo mes anterior.
-    crecimiento_suavizado = float(np.clip(
-        1.0 + 0.50 * (crec - 1.0),
-        0.90,
-        1.20,
-    ))
-    referencia_suavizada = ultimo_ano * crecimiento_suavizado
-
-    # La referencia ya no es un piso obligatorio. Solo aporta 15% adicional.
-    prediccion_final = (
-        0.85 * prediccion_estacional
-        + 0.15 * referencia_suavizada
-    )
-
-    diagnostico.update({
-        "Referencia_ultimo_ano": ultimo_ano,
-        "Referencia_historica": float(referencia_historica),
-        "Crecimiento_YTD": float(crec),
-        "Referencia_YTD": float(referencia_ytd),
-        "Prediccion_estacional": float(prediccion_estacional),
-        "Referencia_suavizada": float(referencia_suavizada),
-        "Ajuste_aplicado": True,
-    })
-    return max(0.0, float(prediccion_final)), diagnostico
 
 @st.cache_data(show_spinner=False)
-def generar_forecast(df, version_modelo="ajuste-suavizado-v2"):
+def generar_forecast(df):
     modelos = entrenar_modelos(df)
     filas = []
     periodos = [202611, 202612]
@@ -542,26 +498,14 @@ def generar_forecast(df, version_modelo="ajuste-suavizado-v2"):
                 PESO_VENTA_DIRECTA * vd
                 + PESO_ESTRUCTURAL * estructural
             )
-            final, diag = aplicar_ajuste_estacional(base, hist, periodo)
+            final = aplicar_ajuste_estacional(base, hist, periodo)
             filas.append({
                 "CODIGO": codigo,
                 "DESCRIPCION": str(meta.get("DESCRIPCION", "")),
                 "CATEGORIA": str(meta.get("CATEGORIA", "SIN_DATO")).strip(),
                 "COMBOS": int(meta.get("COMBOS", 0)),
                 "Periodo": periodo,
-                "Venta_directa": float(vd),
-                "Unidades_pred": float(unid),
-                "Precio_pred": float(precio_prom),
-                "Venta_estructural": float(estructural),
-                "Prediccion_base": float(base),
-                "Referencia_ultimo_ano": diag["Referencia_ultimo_ano"],
-                "Crecimiento_YTD": diag["Crecimiento_YTD"],
-                "Referencia_YTD": diag["Referencia_YTD"],
-                "Prediccion_estacional": diag["Prediccion_estacional"],
-                "Referencia_suavizada": diag["Referencia_suavizada"],
-                "Indice_estacional": diag["Indice_estacional"],
-                "Ajuste_aplicado": diag["Ajuste_aplicado"],
-                "Prediccion_final": float(final),
+                "Prediccion_final": final,
             })
 
     return pd.DataFrame(filas)
@@ -798,37 +742,9 @@ if archivos:
                 "El histórico utiliza exactamente los mismos SKU activos incluidos en el forecast. "
                 "Los productos sin actividad reciente en 2026 se excluyen para evitar saltos artificiales."
             )
-            with st.expander("Diagnóstico del ajuste estacional"):
-                diagnostico_visible = forecast.copy()
-                if categoria != "TODAS":
-                    diagnostico_visible = diagnostico_visible[diagnostico_visible["CATEGORIA"] == categoria]
-                if combo != "TODOS":
-                    diagnostico_visible = diagnostico_visible[
-                        diagnostico_visible["COMBOS"] == (1 if combo == "COMBOS" else 0)
-                    ]
-                if producto != "TODOS":
-                    diagnostico_visible = diagnostico_visible[
-                        diagnostico_visible["CODIGO"].astype(str) == producto
-                    ]
-                columnas_diag = [
-                    "CODIGO", "DESCRIPCION", "CATEGORIA", "Periodo",
-                    "Prediccion_base", "Referencia_ultimo_ano", "Crecimiento_YTD",
-                    "Referencia_YTD", "Prediccion_estacional", "Referencia_suavizada",
-                    "Indice_estacional", "Ajuste_aplicado", "Prediccion_final",
-                ]
-                st.dataframe(
-                    diagnostico_visible[columnas_diag],
-                    use_container_width=True,
-                    hide_index=True,
-                )
-                st.download_button(
-                    "Descargar diagnóstico CSV",
-                    diagnostico_visible[columnas_diag].to_csv(index=False).encode("utf-8-sig"),
-                    "diagnostico_forecast_nov_dic_2026.csv",
-                    "text/csv",
-                )
 
     except Exception as error:
         st.exception(error)
 else:
     st.info("Carga los tres archivos Excel para comenzar.")
+
