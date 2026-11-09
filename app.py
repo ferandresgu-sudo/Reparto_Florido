@@ -437,6 +437,11 @@ def crecimiento_ytd(historial, ano_objetivo):
 
 
 def aplicar_ajuste_estacional(pred_base, historial, periodo):
+    """Ajuste estacional final validado: piso parcial 45% Nov / 60% Dic.
+
+    No copia automáticamente el mismo mes anterior. Si la predicción queda por
+    debajo del piso parcial, recupera solo una parte de la diferencia.
+    """
     mes = periodo % 100
     ano = periodo // 100
     indice = indice_estacional(historial, ano)
@@ -444,27 +449,72 @@ def aplicar_ajuste_estacional(pred_base, historial, periodo):
         (historial["MES_NUM"] == mes) & (historial["AÑO"] < ano)
     ].sort_values("AÑO").tail(2)
 
+    diagnostico = {
+        "Indice_estacional": float(indice),
+        "Referencia_ultimo_ano": np.nan,
+        "Crecimiento_YTD": 1.0,
+        "Prediccion_estacional": float(pred_base),
+        "Prediccion_combinada": float(pred_base),
+        "Piso_parcial": np.nan,
+        "Porcentaje_recuperacion": 0.0,
+        "Correccion_piso": 0.0,
+        "Ajuste_aplicado": False,
+    }
+
     if mismos.empty or indice < UMBRAL_ESTACIONAL:
-        return float(pred_base)
+        return max(0.0, float(pred_base)), diagnostico
 
     valores = mismos["VENTA"].astype(float).to_numpy()
-    referencia = (
-        valores[-1]
-        if len(valores) == 1
-        else 0.65 * valores[-1] + 0.35 * valores[-2]
+    ultimo_ano = float(valores[-1])
+    referencia_historica = (
+        ultimo_ano if len(valores) == 1
+        else 0.65 * ultimo_ano + 0.35 * float(valores[-2])
     )
     crec = crecimiento_ytd(historial, ano)
-    referencia_ytd = referencia * crec
-    ajustada = (
-        PESO_FORECAST_ESTACIONAL * pred_base
-        + (1 - PESO_FORECAST_ESTACIONAL) * referencia_ytd
-    )
-    piso = valores[-1] * (1 + 0.35 * max(crec - 1, 0))
-    return max(float(ajustada), float(piso))
+    referencia_ytd = referencia_historica * crec
 
+    prediccion_estacional = (
+        PESO_FORECAST_ESTACIONAL * float(pred_base)
+        + (1.0 - PESO_FORECAST_ESTACIONAL) * referencia_ytd
+    )
+
+    crecimiento_suavizado = float(np.clip(
+        1.0 + 0.50 * (crec - 1.0), 0.90, 1.20
+    ))
+    referencia_suavizada = ultimo_ano * crecimiento_suavizado
+    prediccion_combinada = (
+        0.90 * prediccion_estacional + 0.10 * referencia_suavizada
+    )
+
+    factor_piso = float(np.clip(
+        1.0 + 0.35 * (crec - 1.0), 0.94, 1.15
+    ))
+    piso_parcial = ultimo_ano * factor_piso
+
+    porcentaje_recuperacion = 0.45 if mes == 11 else 0.60 if mes == 12 else 0.40
+    if prediccion_combinada < piso_parcial:
+        correccion_piso = porcentaje_recuperacion * (
+            piso_parcial - prediccion_combinada
+        )
+        prediccion_final = prediccion_combinada + correccion_piso
+    else:
+        correccion_piso = 0.0
+        prediccion_final = prediccion_combinada
+
+    diagnostico.update({
+        "Referencia_ultimo_ano": ultimo_ano,
+        "Crecimiento_YTD": float(crec),
+        "Prediccion_estacional": float(prediccion_estacional),
+        "Prediccion_combinada": float(prediccion_combinada),
+        "Piso_parcial": float(piso_parcial),
+        "Porcentaje_recuperacion": float(porcentaje_recuperacion),
+        "Correccion_piso": float(correccion_piso),
+        "Ajuste_aplicado": True,
+    })
+    return max(0.0, float(prediccion_final)), diagnostico
 
 @st.cache_data(show_spinner=False)
-def generar_forecast(df):
+def generar_forecast(df, version_modelo="final-45-60-v1"):
     modelos = entrenar_modelos(df)
     filas = []
     periodos = [202611, 202612]
@@ -498,14 +548,28 @@ def generar_forecast(df):
                 PESO_VENTA_DIRECTA * vd
                 + PESO_ESTRUCTURAL * estructural
             )
-            final = aplicar_ajuste_estacional(base, hist, periodo)
+            final, diag = aplicar_ajuste_estacional(base, hist, periodo)
             filas.append({
                 "CODIGO": codigo,
                 "DESCRIPCION": str(meta.get("DESCRIPCION", "")),
                 "CATEGORIA": str(meta.get("CATEGORIA", "SIN_DATO")).strip(),
                 "COMBOS": int(meta.get("COMBOS", 0)),
                 "Periodo": periodo,
-                "Prediccion_final": final,
+                "Venta_directa": float(vd),
+                "Unidades_pred": float(unid),
+                "Precio_pred": float(precio_prom),
+                "Venta_estructural": float(estructural),
+                "Prediccion_base": float(base),
+                "Referencia_ultimo_ano": diag["Referencia_ultimo_ano"],
+                "Crecimiento_YTD": diag["Crecimiento_YTD"],
+                "Prediccion_estacional": diag["Prediccion_estacional"],
+                "Prediccion_combinada": diag["Prediccion_combinada"],
+                "Piso_parcial": diag["Piso_parcial"],
+                "Porcentaje_recuperacion": diag["Porcentaje_recuperacion"],
+                "Correccion_piso": diag["Correccion_piso"],
+                "Indice_estacional": diag["Indice_estacional"],
+                "Ajuste_aplicado": diag["Ajuste_aplicado"],
+                "Prediccion_final": float(final),
             })
 
     return pd.DataFrame(filas)
@@ -594,16 +658,26 @@ if archivos:
             )
             st.stop()
 
-        if "forecast_2026" not in st.session_state:
+        col_boton, col_estado = st.columns([1, 2])
+        with col_boton:
+            if st.button("Limpiar forecast anterior"):
+                st.session_state.pop("forecast_2026_final_45_60", None)
+                st.cache_data.clear()
+                st.cache_resource.clear()
+                st.rerun()
+        with col_estado:
+            st.info("Modelo final activo: recuperación 45% en noviembre y 60% en diciembre.")
+
+        if "forecast_2026_final_45_60" not in st.session_state:
             st.info("Genera el forecast para habilitar la gráfica de noviembre-diciembre de 2026.")
 
-        if st.button("Generar forecast noviembre-diciembre 2026", type="primary"):
+        if st.button("Generar forecast final Nov-Dic 2026", type="primary"):
             with st.spinner("Entrenando el modelo y generando el forecast..."):
-                st.session_state["forecast_2026"] = generar_forecast(df)
+                st.session_state["forecast_2026_final_45_60"] = generar_forecast(df)
             st.rerun()
 
-        if "forecast_2026" in st.session_state:
-            forecast = st.session_state["forecast_2026"]
+        if "forecast_2026_final_45_60" in st.session_state:
+            forecast = st.session_state["forecast_2026_final_45_60"]
             if forecast.empty:
                 st.error("No se encontraron SKU activos con datos recientes de 2026.")
                 st.stop()
@@ -742,6 +816,22 @@ if archivos:
                 "El histórico utiliza exactamente los mismos SKU activos incluidos en el forecast. "
                 "Los productos sin actividad reciente en 2026 se excluyen para evitar saltos artificiales."
             )
+            st.download_button(
+                "Descargar forecast filtrado CSV",
+                universo.to_csv(index=False).encode("utf-8-sig"),
+                "forecast_nov_dic_2026_45_60.csv",
+                "text/csv",
+            )
+            with st.expander("Diagnóstico del ajuste 45%/60%"):
+                diag = universo[[
+                    "CODIGO", "DESCRIPCION", "CATEGORIA", "COMBOS", "Periodo",
+                    "Prediccion_base", "Referencia_ultimo_ano", "Crecimiento_YTD",
+                    "Prediccion_estacional", "Prediccion_combinada", "Piso_parcial",
+                    "Porcentaje_recuperacion", "Correccion_piso",
+                    "Ajuste_aplicado", "Prediccion_final",
+                ]].copy()
+                st.dataframe(diag, use_container_width=True, hide_index=True)
+
 
     except Exception as error:
         st.exception(error)
