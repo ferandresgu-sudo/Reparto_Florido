@@ -13,6 +13,108 @@ st.set_page_config(page_title="Forecast Nov-Dic 2026", layout="wide")
 st.markdown("## Forecast de ventas | Noviembre y diciembre 2026")
 st.caption("Histórico mensual comparable y pronóstico conectado, con filtros de categoría, combo y producto.")
 
+with st.expander("¿Cómo funciona el modelo?", expanded=False):
+    st.markdown(
+        """
+### Resumen
+
+El forecast combina **tres modelos globales CatBoost** y una corrección estacional controlada. El objetivo es estimar las ventas de noviembre y diciembre de 2026 sin limitarse a copiar el cierre de 2025.
+
+### 1. Información utilizada
+
+El modelo aprende con datos mensuales de 2024, 2025 y 2026 hasta octubre:
+
+- Venta monetaria.
+- Unidades vendidas.
+- Precio promedio, recalculado como `VENTA / UNIDADES`.
+- Código, categoría, familia, tipo de producto y condición de combo.
+- Rezagos de 1, 2, 3, 6, 12 y 24 meses.
+- Promedios y variabilidad de los últimos 3, 6 y 12 meses.
+- Mes del año y tendencia reciente.
+
+### 2. Tres pronósticos CatBoost
+
+Se entrenan tres modelos:
+
+1. **Venta directa:** pronostica el importe monetario.
+2. **Unidades:** pronostica cuántas unidades se venderán.
+3. **Precio promedio:** pronostica el precio medio esperado.
+
+La venta estructural se calcula así:
+
+`Venta estructural = Unidades pronosticadas × Precio pronosticado`
+
+La predicción base combina:
+
+`Predicción base = 85% venta directa + 15% venta estructural`
+
+### 3. Estacionalidad de noviembre y diciembre
+
+El ajuste externo solo se activa cuando el SKU presenta un índice estacional mínimo de **1.20**. Esto significa que históricamente noviembre y diciembre deben vender al menos 20% más que el resto del año.
+
+Cuando se activa, se construye una referencia con:
+
+- 65% del mismo mes más reciente.
+- 35% del mismo mes de hace dos años.
+- Crecimiento enero-octubre del año objetivo frente al año anterior.
+
+La señal queda combinada como:
+
+`Predicción estacional = 85% predicción base + 15% referencia histórica YTD`
+
+### 4. Piso parcial validado
+
+La venta del mismo mes anterior no se usa como piso rígido. Solo funciona como protección ante una subestimación extrema.
+
+- En **noviembre** se recupera 45% de la distancia hacia el piso parcial.
+- En **diciembre** se recupera 60%, porque diciembre mostró mayor subestimación en el backtest.
+- Si la predicción ya está por encima del piso, no se agrega corrección.
+
+Esto permite que el forecast quede por encima o por debajo de 2025 según la tendencia, sin copiar exactamente ese valor.
+
+### 5. Validación histórica
+
+La configuración se validó entrenando hasta octubre de 2025 y pronosticando noviembre-diciembre de 2025. Sin combos, los resultados fueron:
+
+| Métrica | Resultado |
+|---|---:|
+| WAPE | 18.42% |
+| MAE | $39,321.84 |
+| RMSE | $113,103.17 |
+| R² | 0.9457 |
+| Sesgo | -6.43% |
+
+El sesgo negativo indica que el modelo sigue siendo conservador. Las métricas son una referencia histórica, no una garantía del error real de 2026.
+
+### 6. Interpretación de la gráfica
+
+- **Línea azul:** ventas reales hasta octubre de 2026.
+- **Línea naranja punteada:** pronóstico de noviembre y diciembre de 2026.
+- Los filtros permiten analizar categoría, productos sin combos, combos o un SKU individual.
+- El histórico utiliza el mismo universo de SKU activos incluidos en el forecast.
+
+### 7. Alcance
+
+El resultado es adecuado como forecast operativo con revisión comercial. Los combos, lanzamientos, bajas, promociones futuras, faltantes y cambios extraordinarios de distribución requieren validación adicional porque esas decisiones no siempre están presentes en el histórico.
+        """
+    )
+
+with st.expander("Fórmulas principales", expanded=False):
+    st.code(
+        """Venta estructural = Unidades predichas * Precio predicho
+
+Predicción base = 0.85 * Venta directa + 0.15 * Venta estructural
+
+Predicción estacional = 0.85 * Predicción base + 0.15 * Referencia histórica YTD
+
+Si Predicción combinada < Piso parcial:
+    Noviembre: Predicción final = combinada + 0.45 * (piso - combinada)
+    Diciembre: Predicción final = combinada + 0.60 * (piso - combinada)
+Si no:
+    Predicción final = Predicción combinada""",
+        language="text",
+    )
+
 MESES = {
     "ENERO": 1, "FEBRERO": 2, "MARZO": 3, "ABRIL": 4,
     "MAYO": 5, "JUNIO": 6, "JULIO": 7, "AGOSTO": 8,
@@ -823,6 +925,10 @@ if archivos:
                 "text/csv",
             )
             with st.expander("Diagnóstico del ajuste 45%/60%"):
+                st.caption(
+                    "Predicción base muestra la salida 85% venta directa + 15% unidades por precio. "
+                    "Corrección piso indica cuánto añadió la protección estacional; cero significa que el modelo ya estaba por encima del piso."
+                )
                 diag = universo[[
                     "CODIGO", "DESCRIPCION", "CATEGORIA", "COMBOS", "Periodo",
                     "Prediccion_base", "Referencia_ultimo_ano", "Crecimiento_YTD",
@@ -837,4 +943,5 @@ if archivos:
         st.exception(error)
 else:
     st.info("Carga los tres archivos Excel para comenzar.")
+
 
