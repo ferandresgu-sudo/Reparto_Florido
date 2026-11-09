@@ -43,7 +43,7 @@ def normalizar_codigo(serie):
 
 
 @st.cache_data(show_spinner=False)
-def cargar_archivos(contenidos, nombres):
+def cargar_archivos(contenidos, nombres, version_cache="carga-v3-por-archivo"):
     partes = []
     requeridas = {"CODIGO", "VENTA", "UNIDADES", "MES", "AÑO"}
     utiles = requeridas | {
@@ -51,18 +51,52 @@ def cargar_archivos(contenidos, nombres):
         "FAMILIA", "TIPO", "COMBOS",
     }
 
+    diagnostico = []
     for contenido, nombre in zip(contenidos, nombres):
+        nombre_mayus = str(nombre).upper()
+        ano_archivo = next((a for a in [2024, 2025, 2026] if str(a) in nombre_mayus), None)
         hojas = pd.read_excel(
             io.BytesIO(contenido), sheet_name=None, engine="openpyxl"
         )
+        filas_archivo = 0
+        hojas_validas = 0
+        anos_detectados = set()
         for hoja, df_hoja in hojas.items():
             if df_hoja is None or df_hoja.empty:
                 continue
             h = df_hoja.copy()
             h.columns = [str(c).strip().upper() for c in h.columns]
-            if not requeridas.issubset(h.columns):
+
+            # AÑO puede venir vacío, en texto, con formato decimal o incorrecto.
+            # El nombre VENTAS 2024/2025/2026 es la referencia más confiable.
+            if "AÑO" not in h.columns:
+                if ano_archivo is None:
+                    diagnostico.append({"Archivo": nombre, "Hoja": hoja, "Estado": "Omitida", "Detalle": "No existe AÑO y no se pudo inferir del nombre"})
+                    continue
+                h["AÑO"] = ano_archivo
+            else:
+                ano_col = pd.to_numeric(h["AÑO"], errors="coerce")
+                if ano_archivo is not None:
+                    # Si el archivo está claramente identificado, corrige columnas copiadas de 2024.
+                    ano_col = pd.Series(ano_archivo, index=h.index, dtype="float64")
+                h["AÑO"] = ano_col
+
+            faltantes = sorted(requeridas - set(h.columns))
+            if faltantes:
+                diagnostico.append({"Archivo": nombre, "Hoja": hoja, "Estado": "Omitida", "Detalle": "Faltan: " + ", ".join(faltantes)})
                 continue
-            partes.append(h[[c for c in h.columns if c in utiles]].copy())
+
+            temp = h[[c for c in h.columns if c in utiles]].copy()
+            partes.append(temp)
+            filas_archivo += len(temp)
+            hojas_validas += 1
+            anos_detectados.update(pd.to_numeric(temp["AÑO"], errors="coerce").dropna().astype(int).unique().tolist())
+
+        diagnostico.append({
+            "Archivo": nombre, "Hoja": "TOTAL",
+            "Estado": "Cargado" if hojas_validas else "Sin hojas válidas",
+            "Detalle": f"{hojas_validas} hojas | {filas_archivo:,} filas | años {sorted(anos_detectados)}"
+        })
 
     if not partes:
         raise ValueError(
@@ -112,7 +146,7 @@ def cargar_archivos(contenidos, nombres):
         agrupado["VENTA"] / agrupado["UNIDADES"],
         np.nan,
     )
-    return completar_calendario(agrupado)
+    return completar_calendario(agrupado), pd.DataFrame(diagnostico)
 
 
 def completar_calendario(df):
@@ -438,14 +472,25 @@ archivos = st.file_uploader(
 
 if archivos:
     try:
-        df = cargar_archivos(
+        df, diagnostico_carga = cargar_archivos(
             [archivo.getvalue() for archivo in archivos],
             [archivo.name for archivo in archivos],
+            version_cache="carga-v3-por-archivo",
         )
         anos_cargados = sorted(df["AÑO"].dropna().astype(int).unique().tolist())
+        conteo_ano = df.groupby("AÑO")["CODIGO"].nunique().to_dict()
+        st.success(
+            "Archivos procesados | "
+            + " | ".join(f"{int(a)}: {int(conteo_ano.get(a, 0))} SKU" for a in anos_cargados)
+        )
+        with st.expander("Diagnóstico de carga de archivos"):
+            st.dataframe(diagnostico_carga, use_container_width=True, hide_index=True)
         faltantes = sorted({2024, 2025, 2026} - set(anos_cargados))
         if faltantes:
-            st.error(f"Faltan datos de los años {faltantes}. Carga los tres archivos antes de generar el forecast.")
+            st.error(
+                f"Después de procesar los Excel siguen faltando los años {faltantes}. "
+                "Abre Diagnóstico de carga para identificar la hoja omitida."
+            )
             st.stop()
 
         if "forecast_2026" not in st.session_state:
