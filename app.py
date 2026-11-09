@@ -42,93 +42,181 @@ def normalizar_codigo(serie):
     return serie.astype(str).str.replace(r"\.0$", "", regex=True).str.strip()
 
 
-@st.cache_data(show_spinner=False)
-def cargar_archivos(contenidos, nombres, version_cache="carga-v3-por-archivo"):
+def _normalizar_encabezado(valor):
+    """Normaliza encabezados de Excel sin depender de espacios, acentos o saltos."""
+    import re
+    import unicodedata
+    texto = unicodedata.normalize("NFKD", str(valor))
+    texto = "".join(c for c in texto if not unicodedata.combining(c))
+    texto = texto.replace("\n", " ").replace("\r", " ").strip().upper()
+    texto = re.sub(r"\s+", " ", texto)
+    return texto
+
+
+def _buscar_columna(columnas, aliases):
+    mapa = {_normalizar_encabezado(c): c for c in columnas}
+    for alias in aliases:
+        alias_normalizado = _normalizar_encabezado(alias)
+        if alias_normalizado in mapa:
+            return mapa[alias_normalizado]
+    return None
+
+
+def _inferir_ano(nombre_archivo):
+    import re
+    coincidencia = re.search(r"(?:19|20)\d{2}", str(nombre_archivo))
+    return int(coincidencia.group()) if coincidencia else None
+
+
+def _inferir_mes(nombre_hoja):
+    nombre = _normalizar_encabezado(nombre_hoja)
+    for mes, numero in MESES.items():
+        if mes in nombre:
+            return numero
+    return None
+
+
+def cargar_archivos(archivos):
+    """Carga robusta de los tres Excel.
+
+    El año se toma del nombre VENTAS 2024/2025/2026. La función acepta una hoja
+    por mes o una tabla consolidada, y reconoce variaciones de encabezados.
+    No usa caché para evitar reutilizar una lectura anterior incompleta.
+    """
     partes = []
-    requeridas = {"CODIGO", "VENTA", "UNIDADES", "MES", "AÑO"}
-    utiles = requeridas | {
-        "PRECIO PROMEDIO", "DESCRIPCION", "CATEGORIA",
-        "FAMILIA", "TIPO", "COMBOS",
+    diagnostico = []
+
+    aliases = {
+        "CODIGO": ["CODIGO", "CÓDIGO", "SKU", "COD PRODUCTO", "COD. PRODUCTO"],
+        "VENTA": ["VENTA", "VENTAS", "MONTO VENTA", "VENTA NETA"],
+        "UNIDADES": ["UNIDADES", "UNIDAD", "UNIDADES VENDIDAS", "CANTIDAD", "PIEZAS"],
+        "MES": ["MES", "NOMBRE MES"],
+        "DESCRIPCION": ["DESCRIPCION", "DESCRIPCIÓN", "PRODUCTO", "NOMBRE PRODUCTO"],
+        "CATEGORIA": ["CATEGORIA", "CATEGORÍA"],
+        "FAMILIA": ["FAMILIA"],
+        "TIPO": ["TIPO"],
+        "COMBOS": ["COMBOS", "COMBO", "ES COMBO"],
     }
 
-    diagnostico = []
-    for contenido, nombre in zip(contenidos, nombres):
-        nombre_mayus = str(nombre).upper()
-        ano_archivo = next((a for a in [2024, 2025, 2026] if str(a) in nombre_mayus), None)
-        hojas = pd.read_excel(
-            io.BytesIO(contenido), sheet_name=None, engine="openpyxl"
-        )
-        filas_archivo = 0
-        hojas_validas = 0
-        anos_detectados = set()
-        for hoja, df_hoja in hojas.items():
-            if df_hoja is None or df_hoja.empty:
+    for archivo in archivos:
+        nombre = archivo.name
+        ano_archivo = _inferir_ano(nombre)
+        if ano_archivo not in {2024, 2025, 2026}:
+            diagnostico.append({
+                "Archivo": nombre, "Hoja": "-", "Estado": "ERROR",
+                "Filas": 0, "Año asignado": ano_archivo,
+                "Detalle": "El nombre debe contener 2024, 2025 o 2026",
+            })
+            continue
+
+        try:
+            contenido = archivo.getvalue()
+            libro = pd.ExcelFile(io.BytesIO(contenido), engine="openpyxl")
+        except Exception as exc:
+            diagnostico.append({
+                "Archivo": nombre, "Hoja": "-", "Estado": "ERROR",
+                "Filas": 0, "Año asignado": ano_archivo,
+                "Detalle": f"No fue posible abrir el Excel: {exc}",
+            })
+            continue
+
+        for hoja in libro.sheet_names:
+            try:
+                h = pd.read_excel(libro, sheet_name=hoja)
+            except Exception as exc:
+                diagnostico.append({
+                    "Archivo": nombre, "Hoja": hoja, "Estado": "ERROR",
+                    "Filas": 0, "Año asignado": ano_archivo,
+                    "Detalle": f"No fue posible leer la hoja: {exc}",
+                })
                 continue
-            h = df_hoja.copy()
-            h.columns = [str(c).strip().upper() for c in h.columns]
 
-            # AÑO puede venir vacío, en texto, con formato decimal o incorrecto.
-            # El nombre VENTAS 2024/2025/2026 es la referencia más confiable.
-            if "AÑO" not in h.columns:
-                if ano_archivo is None:
-                    diagnostico.append({"Archivo": nombre, "Hoja": hoja, "Estado": "Omitida", "Detalle": "No existe AÑO y no se pudo inferir del nombre"})
-                    continue
-                h["AÑO"] = ano_archivo
-            else:
-                ano_col = pd.to_numeric(h["AÑO"], errors="coerce")
-                if ano_archivo is not None:
-                    # Si el archivo está claramente identificado, corrige columnas copiadas de 2024.
-                    ano_col = pd.Series(ano_archivo, index=h.index, dtype="float64")
-                h["AÑO"] = ano_col
+            if h is None or h.empty:
+                diagnostico.append({
+                    "Archivo": nombre, "Hoja": hoja, "Estado": "VACÍA",
+                    "Filas": 0, "Año asignado": ano_archivo,
+                    "Detalle": "Hoja sin registros",
+                })
+                continue
 
-            faltantes = sorted(requeridas - set(h.columns))
+            columnas = {
+                destino: _buscar_columna(h.columns, opciones)
+                for destino, opciones in aliases.items()
+            }
+            obligatorias = ["CODIGO", "VENTA", "UNIDADES"]
+            faltantes = [c for c in obligatorias if columnas[c] is None]
+            mes_hoja = _inferir_mes(hoja)
+            if columnas["MES"] is None and mes_hoja is None:
+                faltantes.append("MES")
+
             if faltantes:
-                diagnostico.append({"Archivo": nombre, "Hoja": hoja, "Estado": "Omitida", "Detalle": "Faltan: " + ", ".join(faltantes)})
+                diagnostico.append({
+                    "Archivo": nombre, "Hoja": hoja, "Estado": "OMITIDA",
+                    "Filas": len(h), "Año asignado": ano_archivo,
+                    "Detalle": "Faltan columnas: " + ", ".join(faltantes),
+                })
                 continue
 
-            temp = h[[c for c in h.columns if c in utiles]].copy()
-            partes.append(temp)
-            filas_archivo += len(temp)
-            hojas_validas += 1
-            anos_detectados.update(pd.to_numeric(temp["AÑO"], errors="coerce").dropna().astype(int).unique().tolist())
+            temp = pd.DataFrame(index=h.index)
+            temp["CODIGO"] = h[columnas["CODIGO"]]
+            temp["VENTA"] = h[columnas["VENTA"]]
+            temp["UNIDADES"] = h[columnas["UNIDADES"]]
+            temp["AÑO"] = ano_archivo
 
-        diagnostico.append({
-            "Archivo": nombre, "Hoja": "TOTAL",
-            "Estado": "Cargado" if hojas_validas else "Sin hojas válidas",
-            "Detalle": f"{hojas_validas} hojas | {filas_archivo:,} filas | años {sorted(anos_detectados)}"
-        })
+            if columnas["MES"] is not None:
+                mes_original = h[columnas["MES"]]
+                mes_texto = mes_original.astype(str).map(_normalizar_encabezado)
+                mes_numero = pd.to_numeric(mes_original, errors="coerce")
+                temp["MES_NUM"] = mes_texto.map(MESES).fillna(mes_numero)
+            else:
+                temp["MES_NUM"] = mes_hoja
+
+            for col in ["DESCRIPCION", "CATEGORIA", "FAMILIA", "TIPO"]:
+                temp[col] = (
+                    h[columnas[col]] if columnas[col] is not None else "SIN_DATO"
+                )
+            temp["COMBOS"] = (
+                h[columnas["COMBOS"]] if columnas["COMBOS"] is not None else 0
+            )
+
+            temp["CODIGO"] = normalizar_codigo(temp["CODIGO"])
+            temp["VENTA"] = pd.to_numeric(temp["VENTA"], errors="coerce")
+            temp["UNIDADES"] = pd.to_numeric(temp["UNIDADES"], errors="coerce")
+            temp["MES_NUM"] = pd.to_numeric(temp["MES_NUM"], errors="coerce")
+            temp["COMBOS"] = pd.to_numeric(temp["COMBOS"], errors="coerce").fillna(0)
+
+            temp = temp.dropna(subset=["CODIGO", "VENTA", "UNIDADES", "MES_NUM"])
+            temp = temp[temp["MES_NUM"].between(1, 12)]
+            temp["MES_NUM"] = temp["MES_NUM"].astype(int)
+            temp["VENTA"] = temp["VENTA"].clip(lower=0)
+            temp["UNIDADES"] = temp["UNIDADES"].clip(lower=0)
+            temp["COMBOS"] = temp["COMBOS"].clip(0, 1).astype(int)
+            temp["Periodo"] = temp["AÑO"] * 100 + temp["MES_NUM"]
+
+            for col in ["DESCRIPCION", "CATEGORIA", "FAMILIA", "TIPO"]:
+                temp[col] = temp[col].fillna("SIN_DATO").astype(str).str.strip()
+
+            if temp.empty:
+                diagnostico.append({
+                    "Archivo": nombre, "Hoja": hoja, "Estado": "OMITIDA",
+                    "Filas": 0, "Año asignado": ano_archivo,
+                    "Detalle": "No quedaron filas válidas después de limpiar",
+                })
+                continue
+
+            partes.append(temp)
+            diagnostico.append({
+                "Archivo": nombre, "Hoja": hoja, "Estado": "CARGADA",
+                "Filas": len(temp), "Año asignado": ano_archivo,
+                "Detalle": f"{temp['CODIGO'].nunique()} SKU | meses {sorted(temp['MES_NUM'].unique().tolist())}",
+            })
 
     if not partes:
         raise ValueError(
-            "No se encontraron hojas con CODIGO, VENTA, UNIDADES, MES y AÑO."
+            "Ninguna hoja pudo cargarse. Abre el diagnóstico y revisa los encabezados."
         )
 
     df = pd.concat(partes, ignore_index=True)
-    df["CODIGO"] = normalizar_codigo(df["CODIGO"])
-    df["MES_NUM"] = (
-        df["MES"].astype(str).str.strip().str.upper().map(MESES)
-    )
-    df["AÑO"] = pd.to_numeric(df["AÑO"], errors="coerce")
-    df["VENTA"] = pd.to_numeric(df["VENTA"], errors="coerce").fillna(0).clip(lower=0)
-    df["UNIDADES"] = pd.to_numeric(df["UNIDADES"], errors="coerce").fillna(0).clip(lower=0)
-
-    if "COMBOS" not in df.columns:
-        df["COMBOS"] = 0
-    df["COMBOS"] = (
-        pd.to_numeric(df["COMBOS"], errors="coerce")
-        .fillna(0).clip(0, 1).astype(int)
-    )
-
-    for col in ["DESCRIPCION", "CATEGORIA", "FAMILIA", "TIPO"]:
-        if col not in df.columns:
-            df[col] = "SIN_DATO"
-        df[col] = df[col].fillna("SIN_DATO").astype(str).str.strip()
-
-    df = df.dropna(subset=["CODIGO", "MES_NUM", "AÑO"])
-    df["AÑO"] = df["AÑO"].astype(int)
-    df["MES_NUM"] = df["MES_NUM"].astype(int)
-    df["Periodo"] = df["AÑO"] * 100 + df["MES_NUM"]
-
     agrupado = (
         df.groupby(["CODIGO", "Periodo", "MES_NUM", "AÑO"], as_index=False)
         .agg(
@@ -146,7 +234,8 @@ def cargar_archivos(contenidos, nombres, version_cache="carga-v3-por-archivo"):
         agrupado["VENTA"] / agrupado["UNIDADES"],
         np.nan,
     )
-    return completar_calendario(agrupado), pd.DataFrame(diagnostico)
+    salida = completar_calendario(agrupado)
+    return salida, pd.DataFrame(diagnostico)
 
 
 def completar_calendario(df):
@@ -472,24 +561,23 @@ archivos = st.file_uploader(
 
 if archivos:
     try:
-        df, diagnostico_carga = cargar_archivos(
-            [archivo.getvalue() for archivo in archivos],
-            [archivo.name for archivo in archivos],
-            version_cache="carga-v3-por-archivo",
+        # La carga no usa caché: cada ejecución procesa exactamente los archivos visibles.
+        df, diagnostico_carga = cargar_archivos(archivos)
+        resumen_anual = (
+            df.groupby("AÑO", as_index=False)
+            .agg(SKU=("CODIGO", "nunique"), Registros=("Periodo", "size"),
+                 Desde=("Periodo", "min"), Hasta=("Periodo", "max"))
         )
-        anos_cargados = sorted(df["AÑO"].dropna().astype(int).unique().tolist())
-        conteo_ano = df.groupby("AÑO")["CODIGO"].nunique().to_dict()
-        st.success(
-            "Archivos procesados | "
-            + " | ".join(f"{int(a)}: {int(conteo_ano.get(a, 0))} SKU" for a in anos_cargados)
-        )
-        with st.expander("Diagnóstico de carga de archivos"):
+        anos_cargados = set(resumen_anual["AÑO"].astype(int).tolist())
+        st.success("Los archivos fueron leídos nuevamente sin utilizar caché.")
+        st.dataframe(resumen_anual, use_container_width=True, hide_index=True)
+        with st.expander("Diagnóstico detallado de cada hoja"):
             st.dataframe(diagnostico_carga, use_container_width=True, hide_index=True)
-        faltantes = sorted({2024, 2025, 2026} - set(anos_cargados))
+        faltantes = sorted({2024, 2025, 2026} - anos_cargados)
         if faltantes:
             st.error(
-                f"Después de procesar los Excel siguen faltando los años {faltantes}. "
-                "Abre Diagnóstico de carga para identificar la hoja omitida."
+                f"No se cargaron datos válidos de {faltantes}. Revisa en el diagnóstico "
+                "qué columna falta en las hojas correspondientes."
             )
             st.stop()
 
@@ -646,3 +734,4 @@ if archivos:
         st.exception(error)
 else:
     st.info("Carga los tres archivos Excel para comenzar.")
+
