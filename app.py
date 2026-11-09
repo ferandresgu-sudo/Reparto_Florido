@@ -10,8 +10,8 @@ except ImportError:
     CatBoostRegressor = None
 
 st.set_page_config(page_title="Forecast Nov-Dic 2026", layout="wide")
-st.title("Forecast de ventas noviembre-diciembre 2026")
-st.caption("Gráfica mensual con segmentadores de categoría, combos y producto.")
+st.markdown("## Forecast de ventas | Noviembre y diciembre 2026")
+st.caption("Histórico mensual comparable y pronóstico conectado, con filtros de categoría, combo y producto.")
 
 MESES = {
     "ENERO": 1, "FEBRERO": 2, "MARZO": 3, "ABRIL": 4,
@@ -337,6 +337,11 @@ def generar_forecast(df):
         hist = historial.sort_values("Periodo")
         if hist.empty:
             continue
+        # Solo pronosticar SKU activos con información reciente de 2026.
+        # Evita saltar directamente de 2024/2025 a noviembre de 2026.
+        ultimo_periodo = int(hist["Periodo"].max())
+        if ultimo_periodo < 202608:
+            continue
         meta = hist.iloc[-1]
 
         venta_directa = predecir_objetivo(
@@ -371,51 +376,58 @@ def generar_forecast(df):
 
 
 def preparar_grafica(df_historico, forecast, categoria, combo, producto):
-    hist = df_historico.copy()
+    """Prepara histórico comparable y una línea forecast conectada a octubre 2026."""
     futuro = forecast.copy()
 
     if categoria != "TODAS":
-        hist = hist[hist["CATEGORIA"] == categoria]
         futuro = futuro[futuro["CATEGORIA"] == categoria]
-
     if combo != "TODOS":
         valor_combo = 1 if combo == "COMBOS" else 0
-        hist = hist[hist["COMBOS"] == valor_combo]
         futuro = futuro[futuro["COMBOS"] == valor_combo]
-
     if producto != "TODOS":
-        hist = hist[hist["CODIGO"].astype(str) == producto]
         futuro = futuro[futuro["CODIGO"].astype(str) == producto]
 
+    # El histórico se restringe al mismo universo de SKU que sí tienen forecast.
+    codigos_activos = futuro["CODIGO"].astype(str).unique().tolist()
+    hist = df_historico[df_historico["CODIGO"].astype(str).isin(codigos_activos)].copy()
+    if hist.empty or futuro.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
     historico = hist.groupby(["AÑO", "MES_NUM"], as_index=False)["VENTA"].sum()
-    historico["Fecha"] = pd.to_datetime(
-        dict(
-            year=historico["AÑO"].astype(int),
-            month=historico["MES_NUM"].astype(int),
-            day=1,
-        )
-    )
+    historico["Fecha"] = pd.to_datetime(dict(
+        year=historico["AÑO"].astype(int),
+        month=historico["MES_NUM"].astype(int), day=1
+    ))
+    historico = historico[historico["Fecha"] <= pd.Timestamp("2026-10-01")]
     historico = historico.rename(columns={"VENTA": "Valor"})
     historico["Serie"] = "Venta real"
 
     previsto = futuro.groupby("Periodo", as_index=False)["Prediccion_final"].sum()
-    previsto["Fecha"] = pd.to_datetime(
-        dict(
-            year=(previsto["Periodo"] // 100).astype(int),
-            month=(previsto["Periodo"] % 100).astype(int),
-            day=1,
-        )
-    )
+    previsto["Fecha"] = pd.to_datetime(dict(
+        year=(previsto["Periodo"] // 100).astype(int),
+        month=(previsto["Periodo"] % 100).astype(int), day=1
+    ))
     previsto = previsto.rename(columns={"Prediccion_final": "Valor"})
-    previsto["Serie"] = "Forecast Nov-Dic 2026"
+    previsto["Serie"] = "Forecast"
 
-    return pd.concat(
-        [
-            historico[["Fecha", "Valor", "Serie"]],
-            previsto[["Fecha", "Valor", "Serie"]],
-        ],
+    # Punto puente: octubre real se agrega al forecast para conectar las líneas.
+    octubre = historico[historico["Fecha"] == pd.Timestamp("2026-10-01")][["Fecha", "Valor"]].copy()
+    if octubre.empty:
+        ultima = historico.sort_values("Fecha").tail(1)[["Fecha", "Valor"]].copy()
+        puente = ultima
+    else:
+        puente = octubre
+    puente["Serie"] = "Forecast"
+    forecast_conectado = pd.concat(
+        [puente[["Fecha", "Valor", "Serie"]], previsto[["Fecha", "Valor", "Serie"]]],
         ignore_index=True,
     ).sort_values("Fecha")
+
+    return (
+        historico[["Fecha", "Valor", "Serie"]].sort_values("Fecha"),
+        forecast_conectado,
+        previsto[["Fecha", "Valor", "Serie"]].sort_values("Fecha"),
+    )
 
 
 archivos = st.file_uploader(
@@ -430,6 +442,11 @@ if archivos:
             [archivo.getvalue() for archivo in archivos],
             [archivo.name for archivo in archivos],
         )
+        anos_cargados = sorted(df["AÑO"].dropna().astype(int).unique().tolist())
+        faltantes = sorted({2024, 2025, 2026} - set(anos_cargados))
+        if faltantes:
+            st.error(f"Faltan datos de los años {faltantes}. Carga los tres archivos antes de generar el forecast.")
+            st.stop()
 
         if "forecast_2026" not in st.session_state:
             st.info("Genera el forecast para habilitar la gráfica de noviembre-diciembre de 2026.")
@@ -441,22 +458,27 @@ if archivos:
 
         if "forecast_2026" in st.session_state:
             forecast = st.session_state["forecast_2026"]
+            if forecast.empty:
+                st.error("No se encontraron SKU activos con datos recientes de 2026.")
+                st.stop()
 
+            st.markdown("### Filtros")
             categorias = ["TODAS"] + sorted(
-                df["CATEGORIA"].dropna().astype(str).str.strip().unique().tolist()
+                forecast["CATEGORIA"].dropna().astype(str).str.strip().unique().tolist()
             )
-
-            c1, c2, c3 = st.columns([2, 1, 3])
+            c1, c2, c3 = st.columns([2, 1.25, 3])
             with c1:
                 categoria = st.selectbox("Categoría", categorias)
             with c2:
-                combo = st.selectbox(
-                    "Combos",
-                    ["TODOS", "SIN COMBOS", "COMBOS"],
-                    index=1,
+                combo = st.segmented_control(
+                    "Tipo de producto",
+                    options=["TODOS", "SIN COMBOS", "COMBOS"],
+                    default="SIN COMBOS",
                 )
+                if combo is None:
+                    combo = "SIN COMBOS"
 
-            universo = df.copy()
+            universo = forecast.copy()
             if categoria != "TODAS":
                 universo = universo[universo["CATEGORIA"] == categoria]
             if combo != "TODOS":
@@ -466,62 +488,114 @@ if archivos:
 
             productos = universo[["CODIGO", "DESCRIPCION"]].drop_duplicates()
             productos["ETIQUETA"] = (
-                productos["CODIGO"].astype(str)
-                + " | "
+                productos["CODIGO"].astype(str) + " | "
                 + productos["DESCRIPCION"].astype(str)
             )
-            mapa_productos = dict(zip(productos["ETIQUETA"], productos["CODIGO"].astype(str)))
-
+            mapa_productos = dict(
+                zip(productos["ETIQUETA"], productos["CODIGO"].astype(str))
+            )
             with c3:
                 seleccion_producto = st.selectbox(
-                    "Producto",
-                    ["TODOS"] + sorted(mapa_productos),
+                    "Producto", ["TODOS"] + sorted(mapa_productos)
                 )
-            producto = (
-                "TODOS"
-                if seleccion_producto == "TODOS"
-                else mapa_productos[seleccion_producto]
-            )
+            producto = "TODOS" if seleccion_producto == "TODOS" else mapa_productos[seleccion_producto]
 
-            datos_grafica = preparar_grafica(
+            historico, forecast_linea, forecast_puntos = preparar_grafica(
                 df, forecast, categoria, combo, producto
             )
+            if historico.empty or forecast_puntos.empty:
+                st.warning("No hay datos comparables para la selección actual.")
+                st.stop()
 
-            if datos_grafica.empty:
-                st.warning("No hay información para la selección actual.")
-            else:
-                grafica = (
-                    alt.Chart(datos_grafica)
-                    .mark_line(point=True, strokeWidth=3)
-                    .encode(
-                        x=alt.X(
-                            "Fecha:T",
-                            title="Mes",
-                            axis=alt.Axis(format="%b %Y", labelAngle=-45),
-                        ),
-                        y=alt.Y(
-                            "Valor:Q",
-                            title="Venta",
-                            axis=alt.Axis(format="$,.2s"),
-                        ),
-                        color=alt.Color(
-                            "Serie:N",
-                            title="Serie",
-                            scale=alt.Scale(
-                                domain=["Venta real", "Forecast Nov-Dic 2026"],
-                                range=["#2563EB", "#F59E0B"],
-                            ),
-                        ),
-                        tooltip=[
-                            alt.Tooltip("Fecha:T", title="Mes", format="%B %Y"),
-                            alt.Tooltip("Serie:N", title="Serie"),
-                            alt.Tooltip("Valor:Q", title="Venta", format="$,.2f"),
-                        ],
-                    )
-                    .properties(height=520)
-                    .interactive()
-                )
-                st.altair_chart(grafica, use_container_width=True)
+            nov = forecast_puntos.loc[
+                forecast_puntos["Fecha"] == pd.Timestamp("2026-11-01"), "Valor"
+            ].sum()
+            dic = forecast_puntos.loc[
+                forecast_puntos["Fecha"] == pd.Timestamp("2026-12-01"), "Valor"
+            ].sum()
+            oct_real = historico.loc[
+                historico["Fecha"] == pd.Timestamp("2026-10-01"), "Valor"
+            ].sum()
+            crecimiento_nov = (nov / oct_real - 1) * 100 if oct_real > 0 else np.nan
+            crecimiento_dic = (dic / nov - 1) * 100 if nov > 0 else np.nan
+
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Octubre 2026 real", f"${oct_real:,.0f}")
+            k2.metric("Noviembre 2026", f"${nov:,.0f}",
+                      f"{crecimiento_nov:+.1f}% vs octubre" if pd.notna(crecimiento_nov) else None)
+            k3.metric("Diciembre 2026", f"${dic:,.0f}",
+                      f"{crecimiento_dic:+.1f}% vs noviembre" if pd.notna(crecimiento_dic) else None)
+            k4.metric("SKU incluidos", f"{universo['CODIGO'].nunique():,}")
+
+            fecha_min = pd.Timestamp("2024-01-01")
+            fecha_max = pd.Timestamp("2026-12-01")
+            eje_x = alt.X(
+                "Fecha:T", title=None,
+                scale=alt.Scale(domain=[fecha_min, fecha_max]),
+                axis=alt.Axis(
+                    format="%b %Y", labelAngle=-35,
+                    tickCount={"interval": "month", "step": 2},
+                    grid=False, labelPadding=10,
+                ),
+            )
+            eje_y = alt.Y(
+                "Valor:Q", title="Venta mensual",
+                scale=alt.Scale(zero=False, nice=True),
+                axis=alt.Axis(format="$,.2s", grid=True, gridOpacity=0.14),
+            )
+            tooltip = [
+                alt.Tooltip("Fecha:T", title="Mes", format="%B %Y"),
+                alt.Tooltip("Valor:Q", title="Venta", format="$,.2f"),
+            ]
+
+            linea_real = alt.Chart(historico).mark_line(
+                color="#3B82F6", strokeWidth=3.2, interpolate="monotone"
+            ).encode(x=eje_x, y=eje_y, tooltip=tooltip)
+            puntos_reales = alt.Chart(historico).mark_circle(
+                color="#3B82F6", size=44, opacity=0.9
+            ).encode(x=eje_x, y=eje_y, tooltip=tooltip)
+
+            linea_forecast = alt.Chart(forecast_linea).mark_line(
+                color="#F59E0B", strokeWidth=3.5,
+                strokeDash=[8, 5], interpolate="monotone"
+            ).encode(x=eje_x, y=eje_y, tooltip=tooltip)
+            puntos_forecast = alt.Chart(forecast_puntos).mark_circle(
+                color="#F59E0B", size=125, stroke="white", strokeWidth=1.5
+            ).encode(x=eje_x, y=eje_y, tooltip=tooltip)
+
+            limite = pd.DataFrame({"Fecha": [pd.Timestamp("2026-11-01")]})
+            regla = alt.Chart(limite).mark_rule(
+                color="#94A3B8", strokeDash=[4, 4], opacity=0.75
+            ).encode(x="Fecha:T")
+            etiqueta = alt.Chart(pd.DataFrame({
+                "Fecha": [pd.Timestamp("2026-11-01")],
+                "Texto": ["Inicio forecast"]
+            })).mark_text(
+                align="left", dx=7, dy=-205,
+                color="#94A3B8", fontSize=12
+            ).encode(x="Fecha:T", text="Texto:N")
+
+            chart = alt.layer(
+                linea_real, puntos_reales,
+                linea_forecast, puntos_forecast,
+                regla, etiqueta,
+            ).properties(
+                height=520,
+                title=alt.TitleParams(
+                    text="Evolución mensual y forecast Nov-Dic 2026",
+                    subtitle="Línea azul: ventas reales | Línea naranja punteada: pronóstico",
+                    anchor="start", fontSize=18, subtitleFontSize=12,
+                    offset=16,
+                ),
+            ).configure_view(strokeWidth=0).configure_axis(
+                labelFontSize=12, titleFontSize=13
+            )
+
+            st.altair_chart(chart, use_container_width=True)
+            st.caption(
+                "El histórico utiliza exactamente los mismos SKU activos incluidos en el forecast. "
+                "Los productos sin actividad reciente en 2026 se excluyen para evitar saltos artificiales."
+            )
 
     except Exception as error:
         st.exception(error)
