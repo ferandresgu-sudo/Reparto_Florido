@@ -53,12 +53,18 @@ def _normalizar_encabezado(valor):
     return texto
 
 
-def _buscar_columna(columnas, aliases):
+def _buscar_columna(columnas, aliases, prefijos=None):
+    """Busca encabezados exactos y también variantes como UNIDADES 2025."""
     mapa = {_normalizar_encabezado(c): c for c in columnas}
     for alias in aliases:
         alias_normalizado = _normalizar_encabezado(alias)
         if alias_normalizado in mapa:
             return mapa[alias_normalizado]
+    for prefijo in prefijos or []:
+        prefijo_normalizado = _normalizar_encabezado(prefijo)
+        for encabezado_normalizado, encabezado_original in mapa.items():
+            if encabezado_normalizado.startswith(prefijo_normalizado):
+                return encabezado_original
     return None
 
 
@@ -140,7 +146,11 @@ def cargar_archivos(archivos):
                 continue
 
             columnas = {
-                destino: _buscar_columna(h.columns, opciones)
+                destino: _buscar_columna(
+                    h.columns,
+                    opciones,
+                    prefijos=["UNIDADES"] if destino == "UNIDADES" else None,
+                )
                 for destino, opciones in aliases.items()
             }
             obligatorias = ["CODIGO", "VENTA", "UNIDADES"]
@@ -208,7 +218,10 @@ def cargar_archivos(archivos):
             diagnostico.append({
                 "Archivo": nombre, "Hoja": hoja, "Estado": "CARGADA",
                 "Filas": len(temp), "Año asignado": ano_archivo,
-                "Detalle": f"{temp['CODIGO'].nunique()} SKU | meses {sorted(temp['MES_NUM'].unique().tolist())}",
+                "Detalle": (
+                    f"{temp['CODIGO'].nunique()} SKU | meses {sorted(temp['MES_NUM'].unique().tolist())} | "
+                    f"unidades leídas desde: {columnas['UNIDADES']}"
+                ),
             })
 
     if not partes:
@@ -734,4 +747,5 @@ if archivos:
         st.exception(error)
 else:
     st.info("Carga los tres archivos Excel para comenzar.")
+
 
