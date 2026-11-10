@@ -72,7 +72,11 @@ La venta del mismo mes anterior no se usa como piso rígido. Solo funciona como 
 
 Esto permite que el forecast quede por encima o por debajo de 2025 según la tendencia, sin copiar exactamente ese valor.
 
-### 5. Validación histórica
+### 5. Calibración selectiva V2 por categoría
+
+Después del ajuste 45%/60%, se aplican factores moderados solo a categorías cuyo backtest mostró sesgo material. Lácteos Culinarios, Chocolate Mesa y Nestlé Professional usan 1.10; RTD 1.08; Chocolate Impulso 0.90; Carnation Polvo 0.92; Cereales y Aguas 0.97. Las demás categorías y los combos mantienen factor 1.00.
+
+### 6. Validación histórica
 
 La configuración se validó entrenando hasta octubre de 2025 y pronosticando noviembre-diciembre de 2025. Sin combos, los resultados fueron:
 
@@ -86,14 +90,14 @@ La configuración se validó entrenando hasta octubre de 2025 y pronosticando no
 
 El sesgo negativo indica que el modelo sigue siendo conservador. Las métricas son una referencia histórica, no una garantía del error real de 2026.
 
-### 6. Interpretación de la gráfica
+### 7. Interpretación de la gráfica
 
 - **Línea azul:** ventas reales hasta octubre de 2026.
 - **Línea naranja punteada:** pronóstico de noviembre y diciembre de 2026.
 - Los filtros permiten analizar categoría, productos sin combos, combos o un SKU individual.
 - El histórico utiliza el mismo universo de SKU activos incluidos en el forecast.
 
-### 7. Alcance
+### 8. Alcance
 
 El resultado es adecuado como forecast operativo con revisión comercial. Los combos, lanzamientos, bajas, promociones futuras, faltantes y cambios extraordinarios de distribución requieren validación adicional porque esas decisiones no siempre están presentes en el histórico.
         """
@@ -138,6 +142,21 @@ PESO_VENTA_DIRECTA = 0.85
 PESO_ESTRUCTURAL = 0.15
 PESO_FORECAST_ESTACIONAL = 0.85
 UMBRAL_ESTACIONAL = 1.20
+
+# Calibración selectiva V2 validada sobre el backtest Nov-Dic 2025 sin combos.
+CALIBRACION_CATEGORIAS_V2 = {
+    "LACTEOS CULINARIOS": 1.10,
+    "CHOCOLATE MESA": 1.10,
+    "NESTLE PROFESSIONAL": 1.10,
+    "RTD": 1.08,
+    "CHOCOLATE IMPULSO": 0.90,
+    "CARNATION POLVO": 0.92,
+    "CEREALES": 0.97,
+    "AGUAS": 0.97,
+}
+FACTOR_CALIBRACION_MIN = 0.90
+FACTOR_CALIBRACION_MAX = 1.10
+APLICAR_CALIBRACION_A_COMBOS = False
 
 
 def normalizar_codigo(serie):
@@ -615,8 +634,31 @@ def aplicar_ajuste_estacional(pred_base, historial, periodo):
     })
     return max(0.0, float(prediccion_final)), diagnostico
 
+def normalizar_categoria_calibracion(categoria):
+    import unicodedata
+    texto = unicodedata.normalize("NFKD", str(categoria))
+    texto = "".join(c for c in texto if not unicodedata.combining(c))
+    return " ".join(texto.upper().strip().split())
+
+
+def aplicar_calibracion_categoria_v2(prediccion, categoria, es_combo=0):
+    """Aplica factor V2 solo a categorías autorizadas y productos sin combo."""
+    prediccion = max(0.0, float(prediccion))
+    categoria_norm = normalizar_categoria_calibracion(categoria)
+    if int(es_combo) == 1 and not APLICAR_CALIBRACION_A_COMBOS:
+        return prediccion, 1.0, False, "Combo sin calibración"
+    factor = float(np.clip(
+        CALIBRACION_CATEGORIAS_V2.get(categoria_norm, 1.0),
+        FACTOR_CALIBRACION_MIN,
+        FACTOR_CALIBRACION_MAX,
+    ))
+    aplicada = not np.isclose(factor, 1.0)
+    motivo = f"Factor V2 de {categoria_norm}" if aplicada else "Categoría sin corrección"
+    return prediccion * factor, factor, aplicada, motivo
+
+
 @st.cache_data(show_spinner=False)
-def generar_forecast(df, version_modelo="final-45-60-v1"):
+def generar_forecast(df, version_modelo="final-45-60-calibracion-V2-v1"):
     modelos = entrenar_modelos(df)
     filas = []
     periodos = [202611, 202612]
@@ -650,7 +692,14 @@ def generar_forecast(df, version_modelo="final-45-60-v1"):
                 PESO_VENTA_DIRECTA * vd
                 + PESO_ESTRUCTURAL * estructural
             )
-            final, diag = aplicar_ajuste_estacional(base, hist, periodo)
+            final_antes_calibracion, diag = aplicar_ajuste_estacional(base, hist, periodo)
+            final, factor_categoria, calibracion_aplicada, motivo_calibracion = (
+                aplicar_calibracion_categoria_v2(
+                    final_antes_calibracion,
+                    meta.get("CATEGORIA", "SIN_DATO"),
+                    meta.get("COMBOS", 0),
+                )
+            )
             filas.append({
                 "CODIGO": codigo,
                 "DESCRIPCION": str(meta.get("DESCRIPCION", "")),
@@ -671,6 +720,10 @@ def generar_forecast(df, version_modelo="final-45-60-v1"):
                 "Correccion_piso": diag["Correccion_piso"],
                 "Indice_estacional": diag["Indice_estacional"],
                 "Ajuste_aplicado": diag["Ajuste_aplicado"],
+                "Prediccion_antes_calibracion": float(final_antes_calibracion),
+                "Factor_calibracion_categoria": float(factor_categoria),
+                "Calibracion_categoria_aplicada": bool(calibracion_aplicada),
+                "Motivo_calibracion": motivo_calibracion,
                 "Prediccion_final": float(final),
             })
 
@@ -760,26 +813,39 @@ if archivos:
             )
             st.stop()
 
+        st.markdown("### Calibración selectiva V2")
+        with st.expander("Ver factores aplicados", expanded=False):
+            tabla_factores_v2 = pd.DataFrame([
+                {"CATEGORIA": categoria, "FACTOR": factor, "CAMBIO_PCT": (factor - 1) * 100}
+                for categoria, factor in CALIBRACION_CATEGORIAS_V2.items()
+            ]).sort_values("CATEGORIA")
+            st.dataframe(
+                tabla_factores_v2.style.format({"FACTOR": "{:.2f}", "CAMBIO_PCT": "{:+.1f}%"}),
+                use_container_width=True,
+                hide_index=True,
+            )
+            st.caption("Los combos mantienen factor 1.00. Las categorías no listadas también permanecen sin cambio.")
+
         col_boton, col_estado = st.columns([1, 2])
         with col_boton:
             if st.button("Limpiar forecast anterior"):
-                st.session_state.pop("forecast_2026_final_45_60", None)
+                st.session_state.pop("forecast_2026_final_45_60_calibracion_V2", None)
                 st.cache_data.clear()
                 st.cache_resource.clear()
                 st.rerun()
         with col_estado:
-            st.info("Modelo final activo: recuperación 45% en noviembre y 60% en diciembre.")
+            st.info("Modelo final activo: piso 45%/60% + calibración selectiva V2 por categoría.")
 
-        if "forecast_2026_final_45_60" not in st.session_state:
+        if "forecast_2026_final_45_60_calibracion_V2" not in st.session_state:
             st.info("Genera el forecast para habilitar la gráfica de noviembre-diciembre de 2026.")
 
-        if st.button("Generar forecast final Nov-Dic 2026", type="primary"):
+        if st.button("Generar forecast final Nov-Dic 2026 con calibración V2", type="primary"):
             with st.spinner("Entrenando el modelo y generando el forecast..."):
-                st.session_state["forecast_2026_final_45_60"] = generar_forecast(df)
+                st.session_state["forecast_2026_final_45_60_calibracion_V2"] = generar_forecast(df)
             st.rerun()
 
-        if "forecast_2026_final_45_60" in st.session_state:
-            forecast = st.session_state["forecast_2026_final_45_60"]
+        if "forecast_2026_final_45_60_calibracion_V2" in st.session_state:
+            forecast = st.session_state["forecast_2026_final_45_60_calibracion_V2"]
             if forecast.empty:
                 st.error("No se encontraron SKU activos con datos recientes de 2026.")
                 st.stop()
@@ -921,7 +987,7 @@ if archivos:
             st.download_button(
                 "Descargar forecast filtrado CSV",
                 universo.to_csv(index=False).encode("utf-8-sig"),
-                "forecast_nov_dic_2026_45_60.csv",
+                "forecast_nov_dic_2026_calibracion_V2.csv",
                 "text/csv",
             )
             with st.expander("Diagnóstico del ajuste 45%/60%"):
@@ -934,8 +1000,30 @@ if archivos:
                     "Prediccion_base", "Referencia_ultimo_ano", "Crecimiento_YTD",
                     "Prediccion_estacional", "Prediccion_combinada", "Piso_parcial",
                     "Porcentaje_recuperacion", "Correccion_piso",
-                    "Ajuste_aplicado", "Prediccion_final",
+                    "Ajuste_aplicado", "Prediccion_antes_calibracion",
+                    "Factor_calibracion_categoria", "Calibracion_categoria_aplicada",
+                    "Motivo_calibracion", "Prediccion_final",
                 ]].copy()
+                resumen_categoria_v2 = (
+                    diag.groupby("CATEGORIA", as_index=False)
+                    .agg(
+                        SKU=("CODIGO", "nunique"),
+                        Antes=("Prediccion_antes_calibracion", "sum"),
+                        Despues=("Prediccion_final", "sum"),
+                        Factor=("Factor_calibracion_categoria", "max"),
+                    )
+                )
+                resumen_categoria_v2["Impacto"] = resumen_categoria_v2["Despues"] - resumen_categoria_v2["Antes"]
+                st.markdown("#### Impacto de la calibración V2 por categoría")
+                st.dataframe(
+                    resumen_categoria_v2.style.format({
+                        "Antes": "${:,.2f}", "Despues": "${:,.2f}",
+                        "Factor": "{:.2f}", "Impacto": "${:+,.2f}",
+                    }),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                st.markdown("#### Detalle por SKU")
                 st.dataframe(diag, use_container_width=True, hide_index=True)
 
 
