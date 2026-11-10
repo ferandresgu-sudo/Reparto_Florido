@@ -72,11 +72,7 @@ La venta del mismo mes anterior no se usa como piso rígido. Solo funciona como 
 
 Esto permite que el forecast quede por encima o por debajo de 2025 según la tendencia, sin copiar exactamente ese valor.
 
-### 5. Calibración selectiva V2 por categoría
-
-Después del ajuste 45%/60%, se aplican factores moderados solo a categorías cuyo backtest mostró sesgo material. Lácteos Culinarios, Chocolate Mesa y Nestlé Professional usan 1.10; RTD 1.08; Chocolate Impulso 0.90; Carnation Polvo 0.92; Cereales y Aguas 0.97. Las demás categorías y los combos mantienen factor 1.00.
-
-### 6. Validación histórica
+### 5. Validación histórica
 
 La configuración se validó entrenando hasta octubre de 2025 y pronosticando noviembre-diciembre de 2025. Sin combos, los resultados fueron:
 
@@ -90,14 +86,14 @@ La configuración se validó entrenando hasta octubre de 2025 y pronosticando no
 
 El sesgo negativo indica que el modelo sigue siendo conservador. Las métricas son una referencia histórica, no una garantía del error real de 2026.
 
-### 7. Interpretación de la gráfica
+### 6. Interpretación de la gráfica
 
 - **Línea azul:** ventas reales hasta octubre de 2026.
 - **Línea naranja punteada:** pronóstico de noviembre y diciembre de 2026.
 - Los filtros permiten analizar categoría, productos sin combos, combos o un SKU individual.
 - El histórico utiliza el mismo universo de SKU activos incluidos en el forecast.
 
-### 8. Alcance
+### 7. Alcance
 
 El resultado es adecuado como forecast operativo con revisión comercial. Los combos, lanzamientos, bajas, promociones futuras, faltantes y cambios extraordinarios de distribución requieren validación adicional porque esas decisiones no siempre están presentes en el histórico.
         """
@@ -657,21 +653,86 @@ def aplicar_calibracion_categoria_v2(prediccion, categoria, es_combo=0):
     return prediccion * factor, factor, aplicada, motivo
 
 
+def extender_historial_hasta_octubre_2026(historial):
+    """Completa meses faltantes hasta octubre 2026 para SKU inactivos.
+
+    Los meses posteriores al último registro se consideran sin venta y sin
+    unidades. El precio se conserva como última referencia disponible. Esto
+    evita tratar julio como si fuera el mes inmediatamente anterior a noviembre.
+    """
+    hist = historial.sort_values("Periodo").copy()
+    ultimo_periodo = int(hist["Periodo"].max())
+    if ultimo_periodo >= 202610:
+        return hist
+
+    ultima_fecha = pd.Timestamp(
+        year=ultimo_periodo // 100,
+        month=ultimo_periodo % 100,
+        day=1,
+    )
+    fechas_faltantes = pd.date_range(
+        ultima_fecha + pd.offsets.MonthBegin(1),
+        pd.Timestamp("2026-10-01"),
+        freq="MS",
+    )
+    if len(fechas_faltantes) == 0:
+        return hist
+
+    meta = hist.iloc[-1].copy()
+    nuevas = []
+    for fecha in fechas_faltantes:
+        fila = meta.copy()
+        fila["AÑO"] = int(fecha.year)
+        fila["MES_NUM"] = int(fecha.month)
+        fila["Periodo"] = int(fecha.year * 100 + fecha.month)
+        fila["VENTA"] = 0.0
+        fila["UNIDADES"] = 0.0
+        # El precio se conserva como referencia; no se inventa un precio cero.
+        fila["PRECIO_PROMEDIO"] = float(meta.get("PRECIO_PROMEDIO", 0.0) or 0.0)
+        nuevas.append(fila)
+    return pd.concat([hist, pd.DataFrame(nuevas)], ignore_index=True)
+
+
+def meses_entre_periodos(periodo_inicial, periodo_final=202610):
+    ai, mi = divmod(int(periodo_inicial), 100)
+    af, mf = divmod(int(periodo_final), 100)
+    return max(0, (af - ai) * 12 + (mf - mi))
+
+
 @st.cache_data(show_spinner=False)
-def generar_forecast(df, version_modelo="final-45-60-calibracion-V2-v1"):
+def generar_forecast(df, version_modelo="final-45-60-calibracion-V2-universo-2026-v2"):
+    """Genera forecast para todos los SKU presentes en ventas 2026.
+
+    Los SKU activos desde agosto 2026 forman el universo base. Los SKU presentes
+    en 2026, pero sin actividad desde agosto, se pronostican y se etiquetan para
+    que el usuario decida mediante segmentador si afectan o no los totales.
+    """
     modelos = entrenar_modelos(df)
     filas = []
     periodos = [202611, 202612]
+    codigos_2026 = set(
+        df.loc[df["AÑO"] == 2026, "CODIGO"].astype(str).unique().tolist()
+    )
 
     for codigo, historial in df.groupby("CODIGO", sort=False):
-        hist = historial.sort_values("Periodo")
-        if hist.empty:
+        if str(codigo) not in codigos_2026:
             continue
-        # Solo pronosticar SKU activos con información reciente de 2026.
-        # Evita saltar directamente de 2024/2025 a noviembre de 2026.
-        ultimo_periodo = int(hist["Periodo"].max())
-        if ultimo_periodo < 202608:
+        hist_original = historial.sort_values("Periodo").copy()
+        if hist_original.empty:
             continue
+
+        ultimo_periodo_disponible = int(hist_original["Periodo"].max())
+        incluido_base = ultimo_periodo_disponible >= 202608
+        estado_forecast = "INCLUIDO_BASE" if incluido_base else "NO_CONTADO_BASE"
+        meses_sin_actividad = meses_entre_periodos(ultimo_periodo_disponible, 202610)
+
+        # Para SKU no contados en el forecast base, se completan con ceros hasta
+        # octubre. Se mantienen separados y no afectan el total salvo elección.
+        hist = (
+            hist_original
+            if incluido_base
+            else extender_historial_hasta_octubre_2026(hist_original)
+        )
         meta = hist.iloc[-1]
 
         venta_directa = predecir_objetivo(
@@ -688,11 +749,10 @@ def generar_forecast(df, version_modelo="final-45-60-calibracion-V2-v1"):
             periodos, venta_directa, unidades, precio
         ):
             estructural = unid * precio_prom
-            base = (
-                PESO_VENTA_DIRECTA * vd
-                + PESO_ESTRUCTURAL * estructural
+            base = PESO_VENTA_DIRECTA * vd + PESO_ESTRUCTURAL * estructural
+            final_antes_calibracion, diag = aplicar_ajuste_estacional(
+                base, hist, periodo
             )
-            final_antes_calibracion, diag = aplicar_ajuste_estacional(base, hist, periodo)
             final, factor_categoria, calibracion_aplicada, motivo_calibracion = (
                 aplicar_calibracion_categoria_v2(
                     final_antes_calibracion,
@@ -701,11 +761,15 @@ def generar_forecast(df, version_modelo="final-45-60-calibracion-V2-v1"):
                 )
             )
             filas.append({
-                "CODIGO": codigo,
+                "CODIGO": str(codigo),
                 "DESCRIPCION": str(meta.get("DESCRIPCION", "")),
                 "CATEGORIA": str(meta.get("CATEGORIA", "SIN_DATO")).strip(),
                 "COMBOS": int(meta.get("COMBOS", 0)),
                 "Periodo": periodo,
+                "Estado_forecast": estado_forecast,
+                "Incluido_forecast_base": bool(incluido_base),
+                "Ultimo_periodo_disponible": ultimo_periodo_disponible,
+                "Meses_sin_actividad_a_octubre": int(meses_sin_actividad),
                 "Venta_directa": float(vd),
                 "Unidades_pred": float(unid),
                 "Precio_pred": float(precio_prom),
@@ -726,7 +790,6 @@ def generar_forecast(df, version_modelo="final-45-60-calibracion-V2-v1"):
                 "Motivo_calibracion": motivo_calibracion,
                 "Prediccion_final": float(final),
             })
-
     return pd.DataFrame(filas)
 
 
@@ -813,46 +876,71 @@ if archivos:
             )
             st.stop()
 
-        st.markdown("### Calibración selectiva V2")
-        with st.expander("Ver factores aplicados", expanded=False):
-            tabla_factores_v2 = pd.DataFrame([
-                {"CATEGORIA": categoria, "FACTOR": factor, "CAMBIO_PCT": (factor - 1) * 100}
-                for categoria, factor in CALIBRACION_CATEGORIAS_V2.items()
-            ]).sort_values("CATEGORIA")
-            st.dataframe(
-                tabla_factores_v2.style.format({"FACTOR": "{:.2f}", "CAMBIO_PCT": "{:+.1f}%"}),
-                use_container_width=True,
-                hide_index=True,
-            )
-            st.caption("Los combos mantienen factor 1.00. Las categorías no listadas también permanecen sin cambio.")
-
         col_boton, col_estado = st.columns([1, 2])
         with col_boton:
             if st.button("Limpiar forecast anterior"):
-                st.session_state.pop("forecast_2026_final_45_60_calibracion_V2", None)
+                st.session_state.pop("forecast_2026_final_universo_2026_v2", None)
                 st.cache_data.clear()
                 st.cache_resource.clear()
                 st.rerun()
         with col_estado:
-            st.info("Modelo final activo: piso 45%/60% + calibración selectiva V2 por categoría.")
+            st.info("Modelo final activo: piso parcial 45%/60% y universo 2026 seleccionable.")
 
-        if "forecast_2026_final_45_60_calibracion_V2" not in st.session_state:
+        if "forecast_2026_final_universo_2026_v2" not in st.session_state:
             st.info("Genera el forecast para habilitar la gráfica de noviembre-diciembre de 2026.")
 
-        if st.button("Generar forecast final Nov-Dic 2026 con calibración V2", type="primary"):
+        if st.button("Generar forecast final Nov-Dic 2026", type="primary"):
             with st.spinner("Entrenando el modelo y generando el forecast..."):
-                st.session_state["forecast_2026_final_45_60_calibracion_V2"] = generar_forecast(df)
+                st.session_state["forecast_2026_final_universo_2026_v2"] = generar_forecast(df)
             st.rerun()
 
-        if "forecast_2026_final_45_60_calibracion_V2" in st.session_state:
-            forecast = st.session_state["forecast_2026_final_45_60_calibracion_V2"]
+        if "forecast_2026_final_universo_2026_v2" in st.session_state:
+            forecast = st.session_state["forecast_2026_final_universo_2026_v2"]
             if forecast.empty:
                 st.error("No se encontraron SKU activos con datos recientes de 2026.")
                 st.stop()
 
             st.markdown("### Filtros")
+            st.markdown("#### Universo de SKU 2026")
+            universo_sku = st.segmented_control(
+                "¿Qué SKU deben afectar la gráfica y los totales?",
+                options=[
+                    "SOLO INCLUIDOS BASE",
+                    "INCLUIR NO CONTADOS",
+                    "SOLO NO CONTADOS",
+                ],
+                default="SOLO INCLUIDOS BASE",
+                help=(
+                    "Incluidos base: SKU con datos desde agosto 2026. "
+                    "Incluir no contados: suma también SKU presentes en 2026 sin actividad reciente. "
+                    "Solo no contados: permite revisarlos por separado sin mezclar el resto."
+                ),
+            )
+            if universo_sku is None:
+                universo_sku = "SOLO INCLUIDOS BASE"
+
+            if universo_sku == "SOLO INCLUIDOS BASE":
+                forecast_universo = forecast[forecast["Incluido_forecast_base"]].copy()
+            elif universo_sku == "SOLO NO CONTADOS":
+                forecast_universo = forecast[~forecast["Incluido_forecast_base"]].copy()
+            else:
+                forecast_universo = forecast.copy()
+
+            conteo_base = forecast.loc[forecast["Incluido_forecast_base"], "CODIGO"].nunique()
+            conteo_no_contado = forecast.loc[~forecast["Incluido_forecast_base"], "CODIGO"].nunique()
+            u1, u2, u3 = st.columns(3)
+            u1.metric("SKU incluidos base", f"{conteo_base:,}")
+            u2.metric("SKU 2026 no contados", f"{conteo_no_contado:,}")
+            u3.metric("SKU en universo seleccionado", f"{forecast_universo['CODIGO'].nunique():,}")
+
+            if universo_sku != "SOLO INCLUIDOS BASE":
+                st.warning(
+                    "Los SKU no contados tienen menor evidencia reciente. Sus meses faltantes hasta "
+                    "octubre se completan con venta/unidades cero. Úsalos como escenario de sensibilidad."
+                )
+
             categorias = ["TODAS"] + sorted(
-                forecast["CATEGORIA"].dropna().astype(str).str.strip().unique().tolist()
+                forecast_universo["CATEGORIA"].dropna().astype(str).str.strip().unique().tolist()
             )
             c1, c2, c3 = st.columns([2, 1.25, 3])
             with c1:
@@ -866,7 +954,7 @@ if archivos:
                 if combo is None:
                     combo = "SIN COMBOS"
 
-            universo = forecast.copy()
+            universo = forecast_universo.copy()
             if categoria != "TODAS":
                 universo = universo[universo["CATEGORIA"] == categoria]
             if combo != "TODOS":
@@ -889,7 +977,7 @@ if archivos:
             producto = "TODOS" if seleccion_producto == "TODOS" else mapa_productos[seleccion_producto]
 
             historico, forecast_linea, forecast_puntos = preparar_grafica(
-                df, forecast, categoria, combo, producto
+                df, forecast_universo, categoria, combo, producto
             )
             if historico.empty or forecast_puntos.empty:
                 st.warning("No hay datos comparables para la selección actual.")
@@ -913,7 +1001,11 @@ if archivos:
                       f"{crecimiento_nov:+.1f}% vs octubre" if pd.notna(crecimiento_nov) else None)
             k3.metric("Diciembre 2026", f"${dic:,.0f}",
                       f"{crecimiento_dic:+.1f}% vs noviembre" if pd.notna(crecimiento_dic) else None)
-            k4.metric("SKU incluidos", f"{universo['CODIGO'].nunique():,}")
+            sku_mostrados = (
+                universo["CODIGO"].astype(str).nunique()
+                if producto == "TODOS" else 1
+            )
+            k4.metric("SKU incluidos", f"{sku_mostrados:,}")
 
             fecha_min = pd.Timestamp("2024-01-01")
             fecha_max = pd.Timestamp("2026-12-01")
@@ -987,10 +1079,10 @@ if archivos:
             st.download_button(
                 "Descargar forecast filtrado CSV",
                 universo.to_csv(index=False).encode("utf-8-sig"),
-                "forecast_nov_dic_2026_calibracion_V2.csv",
+                "forecast_nov_dic_2026_universo_seleccionado.csv",
                 "text/csv",
             )
-            with st.expander("Diagnóstico del ajuste 45%/60%"):
+            with st.expander("Diagnóstico del forecast y universo SKU"):
                 st.caption(
                     "Predicción base muestra la salida 85% venta directa + 15% unidades por precio. "
                     "Corrección piso indica cuánto añadió la protección estacional; cero significa que el modelo ya estaba por encima del piso."
@@ -1014,7 +1106,7 @@ if archivos:
                     )
                 )
                 resumen_categoria_v2["Impacto"] = resumen_categoria_v2["Despues"] - resumen_categoria_v2["Antes"]
-                st.markdown("#### Impacto de la calibración V2 por categoría")
+                st.markdown("#### Resumen por categoría")
                 st.dataframe(
                     resumen_categoria_v2.style.format({
                         "Antes": "${:,.2f}", "Despues": "${:,.2f}",
@@ -1023,6 +1115,29 @@ if archivos:
                     use_container_width=True,
                     hide_index=True,
                 )
+                no_contados = forecast[~forecast["Incluido_forecast_base"]].copy()
+                if not no_contados.empty:
+                    resumen_no_contados = (
+                        no_contados.groupby(
+                            ["CODIGO", "DESCRIPCION", "CATEGORIA", "COMBOS",
+                             "Ultimo_periodo_disponible", "Meses_sin_actividad_a_octubre"],
+                            as_index=False,
+                        )
+                        .agg(Forecast_NovDic=("Prediccion_final", "sum"))
+                        .sort_values("Forecast_NovDic", ascending=False)
+                    )
+                    st.markdown("#### SKU presentes en 2026 no contados en el universo base")
+                    st.dataframe(
+                        resumen_no_contados.style.format({"Forecast_NovDic": "${:,.2f}"}),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                    st.download_button(
+                        "Descargar SKU 2026 no contados",
+                        resumen_no_contados.to_csv(index=False).encode("utf-8-sig"),
+                        "sku_2026_no_contados_forecast_base.csv",
+                        "text/csv",
+                    )
                 st.markdown("#### Detalle por SKU")
                 st.dataframe(diag, use_container_width=True, hide_index=True)
 
@@ -1031,5 +1146,3 @@ if archivos:
         st.exception(error)
 else:
     st.info("Carga los tres archivos Excel para comenzar.")
-
-
