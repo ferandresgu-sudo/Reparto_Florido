@@ -1076,6 +1076,73 @@ if archivos:
                 "El histórico utiliza exactamente los mismos SKU activos incluidos en el forecast. "
                 "Los productos sin actividad reciente en 2026 se excluyen para evitar saltos artificiales."
             )
+
+            # ------------------------------------------------------------------
+            # Tabla resumen: Categoría, Código, Descripción, Nov 2026, Dic 2026
+            # ------------------------------------------------------------------
+            st.markdown("### Tabla resumen: predicción por SKU (Nov-Dic 2026)")
+            st.caption(
+                "Predicción final de venta por código, respetando los filtros actuales "
+                "de universo, categoría, tipo de producto y SKU."
+            )
+
+            tabla_sku = (
+                universo.groupby(
+                    ["CATEGORIA", "CODIGO", "DESCRIPCION", "Periodo"],
+                    as_index=False,
+                )["Prediccion_final"].sum()
+                .pivot(
+                    index=["CATEGORIA", "CODIGO", "DESCRIPCION"],
+                    columns="Periodo",
+                    values="Prediccion_final",
+                )
+                .reset_index()
+            )
+            tabla_sku.columns.name = None
+            tabla_sku = tabla_sku.rename(columns={
+                202611: "Prediccion_Nov_2026",
+                202612: "Prediccion_Dic_2026",
+            })
+            for col in ["Prediccion_Nov_2026", "Prediccion_Dic_2026"]:
+                if col not in tabla_sku.columns:
+                    tabla_sku[col] = 0.0
+                tabla_sku[col] = tabla_sku[col].fillna(0.0)
+
+            tabla_sku["Total_NovDic"] = (
+                tabla_sku["Prediccion_Nov_2026"] + tabla_sku["Prediccion_Dic_2026"]
+            )
+            tabla_sku = tabla_sku.sort_values(
+                ["CATEGORIA", "CODIGO"]
+            ).reset_index(drop=True)
+
+            # Fila de totales al final
+            fila_total = pd.DataFrame([{
+                "CATEGORIA": "TOTAL",
+                "CODIGO": "",
+                "DESCRIPCION": "",
+                "Prediccion_Nov_2026": tabla_sku["Prediccion_Nov_2026"].sum(),
+                "Prediccion_Dic_2026": tabla_sku["Prediccion_Dic_2026"].sum(),
+                "Total_NovDic": tabla_sku["Total_NovDic"].sum(),
+            }])
+            tabla_sku_mostrar = pd.concat([tabla_sku, fila_total], ignore_index=True)
+
+            st.dataframe(
+                tabla_sku_mostrar.style.format({
+                    "Prediccion_Nov_2026": "${:,.2f}",
+                    "Prediccion_Dic_2026": "${:,.2f}",
+                    "Total_NovDic": "${:,.2f}",
+                }),
+                use_container_width=True,
+                hide_index=True,
+                height=440,
+            )
+            st.download_button(
+                "Descargar tabla SKU Nov-Dic 2026 CSV",
+                tabla_sku.to_csv(index=False).encode("utf-8-sig"),
+                "tabla_sku_prediccion_nov_dic_2026.csv",
+                "text/csv",
+            )
+
             st.download_button(
                 "Descargar forecast filtrado CSV",
                 universo.to_csv(index=False).encode("utf-8-sig"),
