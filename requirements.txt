@@ -5,3 +5,5 @@ openpyxl
 scikit-learn
 lightgbm
 catboost
+torch
+chronos-forecasting>=1.5
