@@ -9,13 +9,6 @@ try:
 except ImportError:
     CatBoostRegressor = None
 
-try:
-    import torch
-    from chronos import BaseChronosPipeline
-except ImportError:
-    torch = None
-    BaseChronosPipeline = None
-
 st.set_page_config(page_title="Forecast Nov-Dic 2026", layout="wide")
 st.markdown("## Forecast de ventas | Noviembre y diciembre 2026")
 st.caption("Histórico mensual comparable y pronóstico conectado, con filtros de categoría, combo y producto.")
@@ -25,7 +18,7 @@ with st.expander("¿Cómo funciona el modelo?", expanded=False):
         """
 ### Resumen
 
-El forecast combina **tres modelos globales CatBoost** y una corrección estacional controlada. El objetivo es estimar las ventas de noviembre y diciembre de 2026 sin limitarse a copiar el cierre de 2025.
+El forecast combina modelos globales CatBoost con selección mensual automática por categoría y reconciliación jerárquica SKU-categoría. El objetivo es estimar las ventas de noviembre y diciembre de 2026 sin limitarse a copiar el cierre de 2025.
 
 ### 1. Información utilizada
 
@@ -136,6 +129,7 @@ NUM_FEATURES = (
     + [
         "mean3", "std3", "mean6", "std6", "mean12", "std12",
         "sin_mes", "cos_mes", "MES_NUM", "ANO", "tendencia_3_12",
+        "REGISTRO_PRESENTE",
     ]
 )
 FEATURES = NUM_FEATURES + CAT_FEATURES
@@ -146,22 +140,8 @@ PESO_ESTRUCTURAL = 0.15
 PESO_FORECAST_ESTACIONAL = 0.85
 UMBRAL_ESTACIONAL = 1.20
 
-CHRONOS_MODELO_DEFAULT = "amazon/chronos-bolt-small"
-PESO_CHRONOS_DEFAULT = 0.30
-CHRONOS_BATCH_SIZE = 64
-CHRONOS_MIN_OBSERVACIONES = 6
-
 # Calibración selectiva V2 validada sobre el backtest Nov-Dic 2025 sin combos.
-CALIBRACION_CATEGORIAS_V2 = {
-    "LACTEOS CULINARIOS": 1.00,  # Sin uplift: contracción comercial conocida.
-    "CHOCOLATE MESA": 1.10,
-    "NESTLE PROFESSIONAL": 1.10,
-    "RTD": 1.08,
-    "CHOCOLATE IMPULSO": 0.90,
-    "CARNATION POLVO": 0.92,
-    "CEREALES": 0.97,
-    "AGUAS": 0.97,
-}
+CALIBRACION_CATEGORIAS_V2 = {}  # Desactivada: selección automática por backtesting mensual.
 FACTOR_CALIBRACION_MIN = 0.90
 FACTOR_CALIBRACION_MAX = 1.10
 APLICAR_CALIBRACION_A_COMBOS = False
@@ -396,7 +376,9 @@ def completar_calendario(df):
             dict(year=x["AÑO"], month=x["MES_NUM"], day=1)
         )
         x.index = fechas
+        x["REGISTRO_PRESENTE"] = 1
         x = x.reindex(pd.date_range(fechas.min(), fechas.max(), freq="MS"))
+        x["REGISTRO_PRESENTE"] = x["REGISTRO_PRESENTE"].fillna(0).astype(int)
         x["CODIGO"] = codigo
         x["AÑO"] = x.index.year
         x["MES_NUM"] = x.index.month
@@ -441,6 +423,7 @@ def crear_features(df, objetivo):
     z["sin_mes"] = np.sin(2 * np.pi * z["MES_NUM"] / 12)
     z["cos_mes"] = np.cos(2 * np.pi * z["MES_NUM"] / 12)
     z["ANO"] = z["AÑO"]
+    z["REGISTRO_PRESENTE"] = pd.to_numeric(z.get("REGISTRO_PRESENTE", 1), errors="coerce").fillna(0)
     z["tendencia_3_12"] = np.where(
         z["mean12"].abs() > 1e-9, z["mean3"] / z["mean12"], 1.0
     )
@@ -469,6 +452,8 @@ def nuevo_modelo():
 
 def entrenar_objetivo(df, objetivo):
     f = crear_features(df, objetivo).dropna(subset=["lag1", objetivo]).copy()
+    if "REGISTRO_PRESENTE" in f.columns:
+        f = f[f["REGISTRO_PRESENTE"].eq(1)].copy()
     medianas = f[NUM_FEATURES].median().fillna(0)
     f[NUM_FEATURES] = f[NUM_FEATURES].fillna(medianas)
     pesos = np.where(f["MES_NUM"].isin([11, 12]), 2.5, 1.0)
@@ -511,6 +496,7 @@ def vector_futuro(historial, periodo, objetivo, medianas):
     fila["cos_mes"] = np.cos(2 * np.pi * mes / 12)
     fila["MES_NUM"] = mes
     fila["ANO"] = ano
+    fila["REGISTRO_PRESENTE"] = 0
     fila["tendencia_3_12"] = (
         fila["mean3"] / fila["mean12"]
         if pd.notna(fila["mean12"]) and fila["mean12"] > 0
@@ -719,40 +705,88 @@ def meses_entre_periodos(periodo_inicial, periodo_final=202610):
     return max(0, (af - ai) * 12 + (mf - mi))
 
 
-@st.cache_resource(show_spinner=False)
-def cargar_modelo_chronos(modelo_id):
-    if BaseChronosPipeline is None or torch is None:
-        raise ImportError('Instala: pip install "chronos-forecasting>=1.5" torch')
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    dtype = torch.bfloat16 if device == "cuda" else torch.float32
-    return BaseChronosPipeline.from_pretrained(modelo_id, device_map=device, torch_dtype=dtype), device
+
+def _pronosticos_categoria_historicos(serie):
+    """Backtest causal de métodos mensuales; cada fila usa solo meses anteriores."""
+    y = pd.Series(serie, dtype=float).reset_index(drop=True)
+    out = pd.DataFrame({"Real": y})
+    out["ESTACIONAL_12"] = y.shift(12)
+    out["MEDIANA_3"] = y.shift(1).rolling(3, min_periods=3).median()
+    out["MEDIA_POND_3"] = (
+        0.50 * y.shift(1) + 0.30 * y.shift(2) + 0.20 * y.shift(3)
+    )
+    media3 = y.shift(1).rolling(3, min_periods=3).mean()
+    previa3 = y.shift(4).rolling(3, min_periods=3).mean()
+    tendencia = (media3 / previa3.replace(0, np.nan)).clip(0.80, 1.25)
+    out["TENDENCIA_LIMITADA"] = media3 * tendencia
+    return out
 
 
-def generar_predicciones_chronos(df, codigos, modelo_id, periodos):
-    pipeline, device = cargar_modelo_chronos(modelo_id)
-    resultados, contextos, validos = {}, [], []
-    for codigo in map(str, codigos):
-        serie = (df.loc[df["CODIGO"].astype(str).eq(codigo)].sort_values("Periodo")["VENTA"]
-                   .astype(float).clip(lower=0).to_numpy())
-        if len(serie) < CHRONOS_MIN_OBSERVACIONES or not np.isfinite(serie).all():
-            resultados[codigo] = None
-        else:
-            contextos.append(torch.tensor(serie, dtype=torch.float32)); validos.append(codigo)
-    for inicio in range(0, len(contextos), CHRONOS_BATCH_SIZE):
-        lote=contextos[inicio:inicio+CHRONOS_BATCH_SIZE]; claves=validos[inicio:inicio+CHRONOS_BATCH_SIZE]
-        salida=pipeline.predict_quantiles(lote, prediction_length=len(periodos), quantile_levels=[0.1,0.5,0.9])
-        q=salida[0] if isinstance(salida, tuple) else salida
-        q=q.detach().float().cpu().numpy() if hasattr(q,"detach") else np.asarray(q,float)
-        if q.ndim==2 and len(claves)==1: q=q[None,...]
-        for i,codigo in enumerate(claves):
-            x=q[i]
-            if x.shape==(len(periodos),3): x=x.T
-            resultados[codigo]={per:{"p10":max(0.,float(x[0,j])),"p50":max(0.,float(x[1,j])),"p90":max(0.,float(x[2,j]))} for j,per in enumerate(periodos)}
-    return resultados, device
+def seleccionar_metodo_categoria(df, cortes=12):
+    """Selecciona método por categoría con Score = WAPE + 0.5*|sesgo|."""
+    mensual = (df[df["REGISTRO_PRESENTE"].eq(1)]
+               .groupby(["CATEGORIA", "Periodo"], as_index=False)["VENTA"].sum()
+               .sort_values(["CATEGORIA", "Periodo"]))
+    filas=[]
+    for cat,g in mensual.groupby("CATEGORIA", sort=False):
+        bt=_pronosticos_categoria_historicos(g["VENTA"])
+        bt=bt.tail(int(cortes))
+        for metodo in ["ESTACIONAL_12","MEDIANA_3","MEDIA_POND_3","TENDENCIA_LIMITADA"]:
+            z=bt[["Real",metodo]].dropna()
+            if len(z)<4 or z["Real"].sum()<=0: continue
+            err=z[metodo]-z["Real"]
+            wape=err.abs().sum()/z["Real"].abs().sum()
+            sesgo=err.sum()/z["Real"].abs().sum()
+            filas.append({"CATEGORIA":cat,"Metodo":metodo,"WAPE":wape,
+                          "Sesgo":sesgo,"Score":wape+0.50*abs(sesgo),"Cortes":len(z)})
+    metricas=pd.DataFrame(filas)
+    if metricas.empty: return {}, metricas
+    mejor=(metricas.sort_values(["CATEGORIA","Score"])
+           .groupby("CATEGORIA",as_index=False).first())
+    return dict(zip(mejor["CATEGORIA"],mejor["Metodo"])), metricas
 
+
+def forecast_categoria_mensual(df, categoria, periodo, metodo):
+    g=(df[(df["CATEGORIA"]==categoria)&df["REGISTRO_PRESENTE"].eq(1)]
+       .groupby("Periodo",as_index=False)["VENTA"].sum().sort_values("Periodo"))
+    valores=g["VENTA"].astype(float).tolist()
+    if not valores: return np.nan
+    if metodo=="ESTACIONAL_12" and len(valores)>=12: return valores[-12]
+    if metodo=="MEDIANA_3" and len(valores)>=3: return float(np.median(valores[-3:]))
+    if metodo=="MEDIA_POND_3" and len(valores)>=3:
+        return 0.50*valores[-1]+0.30*valores[-2]+0.20*valores[-3]
+    if metodo=="TENDENCIA_LIMITADA" and len(valores)>=6:
+        m3=np.mean(valores[-3:]); p3=np.mean(valores[-6:-3])
+        fac=np.clip(m3/p3,0.80,1.25) if p3>0 else 1.0
+        return float(m3*fac)
+    return float(np.median(valores[-3:])) if len(valores)>=3 else float(valores[-1])
+
+
+def reconciliar_categoria_sku(forecast, df, peso_categoria=0.60):
+    """Combina total SKU CatBoost con ganador mensual y reconcilia a SKU."""
+    seleccion, metricas = seleccionar_metodo_categoria(df, cortes=12)
+    out=forecast.copy()
+    out["Prediccion_SKU_antes_reconciliacion"]=out["Prediccion_final"]
+    out["Metodo_categoria"]="CATBOOST_SKU"
+    out["Forecast_categoria_modelo"]=np.nan
+    out["Factor_reconciliacion_categoria"]=1.0
+    for (cat,periodo),idx in out.groupby(["CATEGORIA","Periodo"]).groups.items():
+        metodo=seleccion.get(cat)
+        if not metodo: continue
+        objetivo=forecast_categoria_mensual(df,cat,int(periodo),metodo)
+        total_sku=out.loc[idx,"Prediccion_final"].sum()
+        if not np.isfinite(objetivo) or objetivo<0 or total_sku<=0: continue
+        # 60% señal categoría, 40% CatBoost SKU; límite histórico prudente ±25%.
+        total_final=(1-peso_categoria)*total_sku+peso_categoria*objetivo
+        factor=float(np.clip(total_final/total_sku,0.75,1.25))
+        out.loc[idx,"Prediccion_final"]*=factor
+        out.loc[idx,"Metodo_categoria"]=metodo
+        out.loc[idx,"Forecast_categoria_modelo"]=objetivo
+        out.loc[idx,"Factor_reconciliacion_categoria"]=factor
+    return out, metricas
 
 @st.cache_data(show_spinner=False)
-def generar_forecast(df, usar_chronos=True, peso_chronos=PESO_CHRONOS_DEFAULT, modelo_chronos=CHRONOS_MODELO_DEFAULT, version_modelo="hibrido-v1"):
+def _generar_forecast_base(df, version_modelo="mensual-jerarquico-v1"):
     """Genera forecast para todos los SKU presentes en ventas 2026.
 
     Los SKU activos desde agosto 2026 forman el universo base. Los SKU presentes
@@ -765,10 +799,6 @@ def generar_forecast(df, usar_chronos=True, peso_chronos=PESO_CHRONOS_DEFAULT, m
     codigos_2026 = set(
         df.loc[df["AÑO"] == 2026, "CODIGO"].astype(str).unique().tolist()
     )
-    peso_chronos = float(np.clip(peso_chronos, 0, .70)) if usar_chronos else 0.0
-    pred_chronos, dispositivo_chronos = ({c: None for c in codigos_2026}, "DESACTIVADO")
-    if usar_chronos and peso_chronos > 0:
-        pred_chronos, dispositivo_chronos = generar_predicciones_chronos(df, sorted(codigos_2026), modelo_chronos, periodos)
 
     for codigo, historial in df.groupby("CODIGO", sort=False):
         if str(codigo) not in codigos_2026:
@@ -806,16 +836,15 @@ def generar_forecast(df, usar_chronos=True, peso_chronos=PESO_CHRONOS_DEFAULT, m
         ):
             estructural = unid * precio_prom
             base = PESO_VENTA_DIRECTA * vd + PESO_ESTRUCTURAL * estructural
-            final_catboost_antes_calibracion, diag = aplicar_ajuste_estacional(base, hist, periodo)
-            cp = pred_chronos.get(str(codigo)); cp = cp.get(periodo) if isinstance(cp, dict) else None
-            chronos_disponible = cp is not None
-            chronos_p10 = cp["p10"] if cp else np.nan
-            chronos_p50 = cp["p50"] if cp else np.nan
-            chronos_p90 = cp["p90"] if cp else np.nan
-            peso_chronos_efectivo = peso_chronos if chronos_disponible else 0.0
-            prediccion_hibrida_antes_calibracion = ((1-peso_chronos_efectivo)*final_catboost_antes_calibracion + peso_chronos_efectivo*(chronos_p50 if chronos_disponible else 0))
-            final, factor_categoria, calibracion_aplicada, motivo_calibracion = aplicar_calibracion_categoria_v2(
-                prediccion_hibrida_antes_calibracion, meta.get("CATEGORIA", "SIN_DATO"), meta.get("COMBOS", 0)
+            final_antes_calibracion, diag = aplicar_ajuste_estacional(
+                base, hist, periodo
+            )
+            final, factor_categoria, calibracion_aplicada, motivo_calibracion = (
+                aplicar_calibracion_categoria_v2(
+                    final_antes_calibracion,
+                    meta.get("CATEGORIA", "SIN_DATO"),
+                    meta.get("COMBOS", 0),
+                )
             )
             filas.append({
                 "CODIGO": str(codigo),
@@ -841,13 +870,7 @@ def generar_forecast(df, usar_chronos=True, peso_chronos=PESO_CHRONOS_DEFAULT, m
                 "Correccion_piso": diag["Correccion_piso"],
                 "Indice_estacional": diag["Indice_estacional"],
                 "Ajuste_aplicado": diag["Ajuste_aplicado"],
-                "Prediccion_CatBoost_antes_calibracion": float(final_catboost_antes_calibracion),
-                "Chronos_modelo": modelo_chronos if usar_chronos else "DESACTIVADO",
-                "Chronos_dispositivo": dispositivo_chronos, "Chronos_disponible": chronos_disponible,
-                "Chronos_P10": chronos_p10, "Chronos_P50": chronos_p50, "Chronos_P90": chronos_p90,
-                "Peso_Chronos": peso_chronos_efectivo,
-                "Prediccion_hibrida_antes_calibracion": float(prediccion_hibrida_antes_calibracion),
-                "Prediccion_antes_calibracion": float(prediccion_hibrida_antes_calibracion),
+                "Prediccion_antes_calibracion": float(final_antes_calibracion),
                 "Factor_calibracion_categoria": float(factor_categoria),
                 "Calibracion_categoria_aplicada": bool(calibracion_aplicada),
                 "Motivo_calibracion": motivo_calibracion,
@@ -855,6 +878,12 @@ def generar_forecast(df, usar_chronos=True, peso_chronos=PESO_CHRONOS_DEFAULT, m
             })
     return pd.DataFrame(filas)
 
+@st.cache_data(show_spinner=False)
+def generar_forecast(df, version_modelo="mensual-jerarquico-v1"):
+    base=_generar_forecast_base(df,version_modelo)
+    reconciliado, metricas=reconciliar_categoria_sku(base,df,peso_categoria=0.60)
+    reconciliado.attrs["metricas_backtest_categoria"]=metricas
+    return reconciliado
 
 def cargar_venta_semanal_noviembre(archivo):
     """Lee la tabla dinámica por categoría de la hoja PREDICCIONES NOVIEMBRE.
@@ -1020,30 +1049,23 @@ if archivos:
         col_boton, col_estado = st.columns([1, 2])
         with col_boton:
             if st.button("Limpiar forecast anterior"):
-                st.session_state.pop("forecast_2026_final_universo_2026_v2", None)
+                st.session_state.pop("forecast_2026_mensual_jerarquico_v1", None)
                 st.cache_data.clear()
                 st.cache_resource.clear()
                 st.rerun()
         with col_estado:
-            st.info("Modelo final activo: piso parcial 45%/60% y universo 2026 seleccionable.")
+            st.info("Modelo mensual jerárquico activo: backtesting por categoría, reconciliación SKU y sin calibraciones manuales.")
 
-        st.markdown("### Configuración Chronos-Bolt")
-        ch1, ch2, ch3 = st.columns([1.2, 1.4, 2])
-        with ch1: usar_chronos = st.checkbox("Activar Chronos-Bolt", value=True)
-        with ch2: peso_chronos = st.slider("Peso de Chronos", 0, 60, 30, 5, format="%d%%", disabled=not usar_chronos) / 100
-        with ch3: modelo_chronos = st.selectbox("Modelo Chronos", ["amazon/chronos-bolt-tiny","amazon/chronos-bolt-small","amazon/chronos-bolt-base"], index=1, disabled=not usar_chronos)
-        st.caption("Ensamble = (1-peso) x CatBoost ajustado + peso x Chronos P50; después se aplica calibración por categoría.")
-
-        if "forecast_2026_final_universo_2026_v2" not in st.session_state:
+        if "forecast_2026_mensual_jerarquico_v1" not in st.session_state:
             st.info("Genera el forecast para habilitar la gráfica de noviembre-diciembre de 2026.")
 
-        if st.button("Generar forecast final Nov-Dic 2026", type="primary"):
-            with st.spinner("Entrenando CatBoost y ejecutando Chronos-Bolt..."):
-                st.session_state["forecast_2026_final_universo_2026_v2"] = generar_forecast(df, usar_chronos, peso_chronos, modelo_chronos)
+        if st.button("Generar forecast mensual jerárquico Nov-Dic 2026", type="primary"):
+            with st.spinner("Entrenando el modelo y generando el forecast..."):
+                st.session_state["forecast_2026_mensual_jerarquico_v1"] = generar_forecast(df)
             st.rerun()
 
-        if "forecast_2026_final_universo_2026_v2" in st.session_state:
-            forecast = st.session_state["forecast_2026_final_universo_2026_v2"]
+        if "forecast_2026_mensual_jerarquico_v1" in st.session_state:
+            forecast = st.session_state["forecast_2026_mensual_jerarquico_v1"]
             if forecast.empty:
                 st.error("No se encontraron SKU activos con datos recientes de 2026.")
                 st.stop()
@@ -1712,9 +1734,7 @@ if archivos:
                     "Prediccion_base", "Referencia_ultimo_ano", "Crecimiento_YTD",
                     "Prediccion_estacional", "Prediccion_combinada", "Piso_parcial",
                     "Porcentaje_recuperacion", "Correccion_piso",
-                    "Ajuste_aplicado", "Prediccion_CatBoost_antes_calibracion",
-                    "Chronos_disponible", "Chronos_P10", "Chronos_P50", "Chronos_P90", "Peso_Chronos",
-                    "Prediccion_hibrida_antes_calibracion", "Prediccion_antes_calibracion",
+                    "Ajuste_aplicado", "Prediccion_antes_calibracion",
                     "Factor_calibracion_categoria", "Calibracion_categoria_aplicada",
                     "Motivo_calibracion", "Prediccion_final",
                 ]].copy()
@@ -1760,11 +1780,23 @@ if archivos:
                         "sku_2026_no_contados_forecast_base.csv",
                         "text/csv",
                     )
+                st.markdown("#### Backtesting mensual por categoría")
+                metricas_bt = forecast.attrs.get("metricas_backtest_categoria", pd.DataFrame())
+                if not metricas_bt.empty:
+                    st.dataframe(metricas_bt.style.format({"WAPE":"{:.1%}","Sesgo":"{:+.1%}","Score":"{:.3f}"}),
+                                 use_container_width=True, hide_index=True)
                 st.markdown("#### Detalle por SKU")
-                st.dataframe(diag, use_container_width=True, hide_index=True)
+                columnas_extra=[c for c in ["Prediccion_SKU_antes_reconciliacion","Metodo_categoria",
+                    "Forecast_categoria_modelo","Factor_reconciliacion_categoria"] if c in universo.columns]
+                st.dataframe(universo[["CODIGO","CATEGORIA","Periodo","Prediccion_final"]+columnas_extra],
+                             use_container_width=True, hide_index=True)
 
 
     except Exception as error:
         st.exception(error)
 else:
     st.info("Carga los tres archivos Excel para comenzar.")
+
+
+
+
