@@ -9,9 +9,9 @@ try:
 except ImportError:
     CatBoostRegressor = None
 
-st.set_page_config(page_title="Forecast Nov-Dic 2026 | Régimen automático", layout="wide")
+st.set_page_config(page_title="Forecast Nov-Dic 2026", layout="wide")
 st.markdown("## Forecast de ventas | Noviembre y diciembre 2026")
-st.caption("Forecast mensual con crecimiento interno en valor, volumen, precio, portafolio comparable y detección automática de contracción.")
+st.caption("Histórico mensual comparable y pronóstico conectado, con filtros de categoría, combo y producto.")
 
 with st.expander("¿Cómo funciona el modelo?", expanded=False):
     st.markdown(
@@ -130,8 +130,6 @@ NUM_FEATURES = (
         "mean3", "std3", "mean6", "std6", "mean12", "std12",
         "sin_mes", "cos_mes", "MES_NUM", "ANO", "tendencia_3_12",
         "REGISTRO_PRESENTE",
-        # Señales internas de categoría. Se calculan solo con información previa
-        # al mes objetivo para evitar fuga de información.
         "CAT_VALOR_LAG1", "CAT_UNIDADES_LAG1", "CAT_PRECIO_LAG1",
         "CAT_CREC_VALOR_YOY", "CAT_CREC_VOL_YOY", "CAT_CREC_PRECIO_YOY",
         "CAT_TENDENCIA_VALOR_3M", "CAT_TENDENCIA_VOL_3M",
@@ -413,116 +411,105 @@ def completar_calendario(df):
     return z
 
 
-def _division_segura(numerador, denominador, default=0.0):
-    """División vectorizada estable; evita infinitos en crecimientos."""
-    den = pd.to_numeric(denominador, errors="coerce")
-    num = pd.to_numeric(numerador, errors="coerce")
-    salida = np.where(den.abs() > 1e-9, num / den, np.nan)
-    return pd.Series(salida, index=getattr(num, "index", None)).replace([np.inf, -np.inf], np.nan).fillna(default)
+def _serie_numerica(df, columna, valor=0.0):
+    """Devuelve siempre una Serie numérica alineada al índice de df."""
+    if columna not in df.columns:
+        return pd.Series(valor, index=df.index, dtype="float64")
+    return pd.to_numeric(df[columna], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(valor)
+
+
+def _division_segura(numerador, denominador, valor_neutro=0.0):
+    """División vectorizada que siempre devuelve Series y nunca escalares."""
+    num = pd.Series(numerador).astype(float)
+    den = pd.Series(denominador, index=num.index).astype(float)
+    salida = num.div(den.where(den.abs() > 1e-9))
+    return salida.replace([np.inf, -np.inf], np.nan).fillna(valor_neutro)
 
 
 def crear_features_categoria_causales(df):
-    """Crea señales internas de valor, volumen, precio, LFL y régimen.
-
-    Cada fila del mes t recibe únicamente estadísticas cerradas hasta t-1.
-    Por eso las variables pueden usarse tanto en entrenamiento como en forecast
-    sin utilizar información futura ni depender de la primera semana del mes.
-    """
-    z = df.sort_values(["Periodo", "CATEGORIA", "CODIGO"]).copy()
+    """Señales de categoría disponibles antes del mes a pronosticar."""
+    requeridas = {"CATEGORIA", "CODIGO", "Periodo", "VENTA", "UNIDADES"}
+    faltantes = requeridas.difference(df.columns)
+    if faltantes:
+        raise ValueError(f"Faltan columnas para régimen de categoría: {sorted(faltantes)}")
+    z = df.sort_values(["CATEGORIA", "CODIGO", "Periodo"]).copy()
+    z["VENTA"] = _serie_numerica(z, "VENTA", 0.0)
+    z["UNIDADES"] = _serie_numerica(z, "UNIDADES", 0.0)
     base = (z.groupby(["CATEGORIA", "Periodo"], as_index=False)
-              .agg(CAT_VALOR=("VENTA", "sum"),
-                   CAT_UNIDADES=("UNIDADES", "sum"),
-                   CAT_SKU_ACTIVOS=("CODIGO", lambda s: s[z.loc[s.index, "UNIDADES"].gt(0)].nunique())))
-    base = base.sort_values(["CATEGORIA", "Periodo"])
-    base["CAT_PRECIO"] = np.where(base["CAT_UNIDADES"] > 0,
-                                   base["CAT_VALOR"] / base["CAT_UNIDADES"], np.nan)
+              .agg(CAT_VALOR=("VENTA", "sum"), CAT_UNIDADES=("UNIDADES", "sum")))
+    base = base.sort_values(["CATEGORIA", "Periodo"]).reset_index(drop=True)
+    base["CAT_PRECIO"] = _division_segura(base["CAT_VALOR"], base["CAT_UNIDADES"], 0.0)
     g = base.groupby("CATEGORIA", group_keys=False)
-    for col, nombre in [("CAT_VALOR", "VALOR"), ("CAT_UNIDADES", "UNIDADES"), ("CAT_PRECIO", "PRECIO")]:
-        base[f"CAT_{nombre}_LAG1"] = g[col].shift(1)
-        base[f"CAT_{nombre}_LAG12"] = g[col].shift(12)
-    base["CAT_CREC_VALOR_YOY"] = _division_segura(base["CAT_VALOR_LAG1"], base["CAT_VALOR_LAG12"], 1.0) - 1.0
-    base["CAT_CREC_VOL_YOY"] = _division_segura(base["CAT_UNIDADES_LAG1"], base["CAT_UNIDADES_LAG12"], 1.0) - 1.0
-    base["CAT_CREC_PRECIO_YOY"] = _division_segura(base["CAT_PRECIO_LAG1"], base["CAT_PRECIO_LAG12"], 1.0) - 1.0
+    for col, nom in [("CAT_VALOR","VALOR"),("CAT_UNIDADES","UNIDADES"),("CAT_PRECIO","PRECIO")]:
+        base[f"CAT_{nom}_LAG1"] = g[col].shift(1)
+        base[f"CAT_{nom}_LAG12"] = g[col].shift(12)
+    base["CAT_CREC_VALOR_YOY"] = _division_segura(base["CAT_VALOR_LAG1"],base["CAT_VALOR_LAG12"],1.0)-1
+    base["CAT_CREC_VOL_YOY"] = _division_segura(base["CAT_UNIDADES_LAG1"],base["CAT_UNIDADES_LAG12"],1.0)-1
+    base["CAT_CREC_PRECIO_YOY"] = _division_segura(base["CAT_PRECIO_LAG1"],base["CAT_PRECIO_LAG12"],1.0)-1
+    for col, nom in [("CAT_VALOR","VALOR"),("CAT_UNIDADES","VOL")]:
+        ult3=g[col].transform(lambda s:s.shift(1).rolling(3,min_periods=2).mean())
+        ant3=g[col].transform(lambda s:s.shift(4).rolling(3,min_periods=2).mean())
+        base[f"CAT_TENDENCIA_{nom}_3M"]=_division_segura(ult3,ant3,1.0)-1
+    base["CAT_ACELERACION_VOL"]=(base["CAT_TENDENCIA_VOL_3M"]-g["CAT_TENDENCIA_VOL_3M"].shift(3)).fillna(0.0)
 
-    for col, nombre in [("CAT_VALOR", "VALOR"), ("CAT_UNIDADES", "VOL")]:
-        ult3 = g[col].transform(lambda s: s.shift(1).rolling(3, min_periods=2).mean())
-        ant3 = g[col].transform(lambda s: s.shift(4).rolling(3, min_periods=2).mean())
-        base[f"CAT_TENDENCIA_{nombre}_3M"] = _division_segura(ult3, ant3, 1.0) - 1.0
-    base["CAT_ACELERACION_VOL"] = (
-        base["CAT_TENDENCIA_VOL_3M"] - g["CAT_TENDENCIA_VOL_3M"].shift(3)
-    ).fillna(0.0)
-
-    # Amplitud: porcentaje de SKU comparables cuya unidad de t-1 cayó vs t-13.
-    sku = z[["CATEGORIA", "CODIGO", "Periodo", "UNIDADES", "VENTA"]].copy()
-    sku = sku.sort_values(["CATEGORIA", "CODIGO", "Periodo"])
-    gs = sku.groupby(["CATEGORIA", "CODIGO"], group_keys=False)
-    sku["U_LAG1"] = gs["UNIDADES"].shift(1)
-    sku["U_LAG13"] = gs["UNIDADES"].shift(13)
-    sku["V_LAG1"] = gs["VENTA"].shift(1)
-    sku["V_LAG13"] = gs["VENTA"].shift(13)
-    sku["COMPARABLE"] = sku["U_LAG1"].notna() & sku["U_LAG13"].notna() & sku["U_LAG13"].gt(0)
-    sku["CAYENDO_VOL"] = sku["COMPARABLE"] & sku["U_LAG1"].lt(sku["U_LAG13"])
-    amplitud = (sku.groupby(["CATEGORIA", "Periodo"], as_index=False)
-                  .agg(COMPARABLE=("COMPARABLE", "sum"), CAYENDO=("CAYENDO_VOL", "sum"),
-                       VALOR_LFL_ACT=("V_LAG1", lambda s: s[sku.loc[s.index, "COMPARABLE"]].sum()),
-                       VALOR_LFL_ANT=("V_LAG13", lambda s: s[sku.loc[s.index, "COMPARABLE"]].sum()),
-                       VOL_LFL_ACT=("U_LAG1", lambda s: s[sku.loc[s.index, "COMPARABLE"]].sum()),
-                       VOL_LFL_ANT=("U_LAG13", lambda s: s[sku.loc[s.index, "COMPARABLE"]].sum())))
-    amplitud["CAT_PCT_SKU_CAYENDO_VOL"] = _division_segura(amplitud["CAYENDO"], amplitud["COMPARABLE"], 0.0)
-    amplitud["CAT_CREC_VALOR_LFL_YOY"] = _division_segura(amplitud["VALOR_LFL_ACT"], amplitud["VALOR_LFL_ANT"], 1.0) - 1.0
-    amplitud["CAT_CREC_VOL_LFL_YOY"] = _division_segura(amplitud["VOL_LFL_ACT"], amplitud["VOL_LFL_ANT"], 1.0) - 1.0
-    base = base.merge(amplitud[["CATEGORIA", "Periodo", "CAT_PCT_SKU_CAYENDO_VOL",
-                                "CAT_CREC_VALOR_LFL_YOY", "CAT_CREC_VOL_LFL_YOY"]],
-                      on=["CATEGORIA", "Periodo"], how="left")
-
-    # Score negativo = contracción. La amplitud se centra en 50%.
-    for c in ["CAT_CREC_VOL_YOY", "CAT_TENDENCIA_VOL_3M", "CAT_CREC_VALOR_YOY",
-              "CAT_ACELERACION_VOL", "CAT_CREC_VOL_LFL_YOY"]:
-        base[c] = base[c].clip(-0.50, 0.50).fillna(0.0)
-    base["CAT_PCT_SKU_CAYENDO_VOL"] = base["CAT_PCT_SKU_CAYENDO_VOL"].fillna(0.0).clip(0, 1)
-    amplitud_centrada = -(base["CAT_PCT_SKU_CAYENDO_VOL"] - 0.50)
-    base["CAT_SCORE_CONTRACCION"] = (
-        0.25 * base["CAT_CREC_VOL_LFL_YOY"]
-        + 0.20 * base["CAT_CREC_VOL_YOY"]
-        + 0.20 * base["CAT_TENDENCIA_VOL_3M"]
-        + 0.15 * base["CAT_CREC_VALOR_YOY"]
-        + 0.10 * base["CAT_ACELERACION_VOL"]
-        + 0.10 * amplitud_centrada
-    ).clip(-0.50, 0.50)
-    condiciones = pd.DataFrame({
-        "vol_lfl": base["CAT_CREC_VOL_LFL_YOY"] < -0.05,
-        "tendencia": base["CAT_TENDENCIA_VOL_3M"] < -0.05,
-        "aceleracion": base["CAT_ACELERACION_VOL"] < -0.05,
-        "amplitud": base["CAT_PCT_SKU_CAYENDO_VOL"] > 0.60,
-    })
-    base["CAT_SENALES_CONTRACCION"] = condiciones.sum(axis=1)
-    base["CAT_REGIMEN"] = np.select(
-        [base["CAT_SENALES_CONTRACCION"].ge(3) & base["CAT_SCORE_CONTRACCION"].lt(-0.20),
-         base["CAT_SENALES_CONTRACCION"].ge(3),
-         base["CAT_SCORE_CONTRACCION"].lt(-0.05),
-         base["CAT_SCORE_CONTRACCION"].gt(0.05)],
-        ["CONTRACCION_SEVERA", "CONTRACCION", "DESACELERACION", "EXPANSION"],
-        default="ESTABLE",
-    )
-    mapa_regimen = {"CONTRACCION_SEVERA": -2, "CONTRACCION": -1,
-                    "DESACELERACION": -0.5, "ESTABLE": 0, "EXPANSION": 1}
-    base["CAT_REGIMEN_NUM"] = base["CAT_REGIMEN"].map(mapa_regimen).fillna(0.0)
-    base = base.rename(columns={"CAT_VALOR_LAG1": "CAT_VALOR_LAG1",
-                                "CAT_UNIDADES_LAG1": "CAT_UNIDADES_LAG1",
-                                "CAT_PRECIO_LAG1": "CAT_PRECIO_LAG1"})
-    columnas = ["CATEGORIA", "Periodo", "CAT_REGIMEN", "CAT_SENALES_CONTRACCION"] + [
-        c for c in NUM_FEATURES if c.startswith("CAT_")
-    ]
-    return base[list(dict.fromkeys(columnas))]
+    sku=z[["CATEGORIA","CODIGO","Periodo","VENTA","UNIDADES"]].copy()
+    gs=sku.groupby(["CATEGORIA","CODIGO"],group_keys=False)
+    for col,pref in [("VENTA","V"),("UNIDADES","U")]:
+        sku[f"{pref}_LAG1"]=gs[col].shift(1)
+        sku[f"{pref}_LAG13"]=gs[col].shift(13)
+    sku["COMPARABLE"]=sku["U_LAG1"].notna() & sku["U_LAG13"].gt(0)
+    sku["CAYENDO"]=sku["COMPARABLE"] & sku["U_LAG1"].lt(sku["U_LAG13"])
+    def suma_comp(s):
+        return s.where(sku.loc[s.index,"COMPARABLE"]).sum()
+    amp=(sku.groupby(["CATEGORIA","Periodo"],as_index=False)
+          .agg(COMPARABLE=("COMPARABLE","sum"),CAYENDO=("CAYENDO","sum"),
+               V_ACT=("V_LAG1",suma_comp),V_ANT=("V_LAG13",suma_comp),
+               U_ACT=("U_LAG1",suma_comp),U_ANT=("U_LAG13",suma_comp)))
+    amp["CAT_PCT_SKU_CAYENDO_VOL"]=_division_segura(amp["CAYENDO"],amp["COMPARABLE"],0.0)
+    amp["CAT_CREC_VALOR_LFL_YOY"]=_division_segura(amp["V_ACT"],amp["V_ANT"],1.0)-1
+    amp["CAT_CREC_VOL_LFL_YOY"]=_division_segura(amp["U_ACT"],amp["U_ANT"],1.0)-1
+    base=base.merge(amp[["CATEGORIA","Periodo","CAT_PCT_SKU_CAYENDO_VOL","CAT_CREC_VALOR_LFL_YOY","CAT_CREC_VOL_LFL_YOY"]],on=["CATEGORIA","Periodo"],how="left",validate="one_to_one")
+    for c in ["CAT_CREC_VOL_YOY","CAT_TENDENCIA_VOL_3M","CAT_CREC_VALOR_YOY","CAT_ACELERACION_VOL","CAT_CREC_VOL_LFL_YOY"]:
+        base[c]=_serie_numerica(base,c,0.0).clip(-0.50,0.50)
+    base["CAT_PCT_SKU_CAYENDO_VOL"]=_serie_numerica(base,"CAT_PCT_SKU_CAYENDO_VOL",0.0).clip(0,1)
+    base["CAT_SCORE_CONTRACCION"]=(
+        .25*base["CAT_CREC_VOL_LFL_YOY"]+.20*base["CAT_CREC_VOL_YOY"]+
+        .20*base["CAT_TENDENCIA_VOL_3M"]+.15*base["CAT_CREC_VALOR_YOY"]+
+        .10*base["CAT_ACELERACION_VOL"]-.10*(base["CAT_PCT_SKU_CAYENDO_VOL"]-.50)
+    ).clip(-.50,.50)
+    base["CAT_SENALES_CONTRACCION"]=(
+        (base["CAT_CREC_VOL_LFL_YOY"]<-.05).astype(int)+
+        (base["CAT_TENDENCIA_VOL_3M"]<-.05).astype(int)+
+        (base["CAT_ACELERACION_VOL"]<-.05).astype(int)+
+        (base["CAT_PCT_SKU_CAYENDO_VOL"]>.60).astype(int))
+    base["CAT_REGIMEN"]=np.select([
+        (base["CAT_SENALES_CONTRACCION"]>=3)&(base["CAT_SCORE_CONTRACCION"]<-.20),
+        base["CAT_SENALES_CONTRACCION"]>=3,base["CAT_SCORE_CONTRACCION"]<-.05,
+        base["CAT_SCORE_CONTRACCION"]>.05],
+        ["CONTRACCION_SEVERA","CONTRACCION","DESACELERACION","EXPANSION"],default="ESTABLE")
+    base["CAT_REGIMEN_NUM"]=base["CAT_REGIMEN"].map({"CONTRACCION_SEVERA":-2,"CONTRACCION":-1,"DESACELERACION":-.5,"ESTABLE":0,"EXPANSION":1}).astype(float)
+    cols=["CATEGORIA","Periodo","CAT_REGIMEN","CAT_SENALES_CONTRACCION"]+[c for c in NUM_FEATURES if c.startswith("CAT_")]
+    return base[list(dict.fromkeys(cols))]
 
 
 def anexar_features_categoria(df):
-    cat = crear_features_categoria_causales(df)
-    z = df.merge(cat, on=["CATEGORIA", "Periodo"], how="left")
+    """Idempotente: puede llamarse varias veces sin columnas _x/_y."""
+    z=df.copy()
+    generadas=[c for c in NUM_FEATURES if c.startswith("CAT_")]+["CAT_REGIMEN","CAT_SENALES_CONTRACCION"]
+    borrar=[c for c in z.columns if c in generadas or (c.startswith("CAT_") and (c.endswith("_x") or c.endswith("_y")))]
+    z=z.drop(columns=borrar,errors="ignore")
+    cat=crear_features_categoria_causales(z)
+    z=z.merge(cat,on=["CATEGORIA","Periodo"],how="left",validate="many_to_one")
     for c in [x for x in NUM_FEATURES if x.startswith("CAT_")]:
-        z[c] = pd.to_numeric(z.get(c, 0.0), errors="coerce").fillna(0.0)
-    z["CAT_REGIMEN"] = z.get("CAT_REGIMEN", "ESTABLE").fillna("ESTABLE")
-    z["CAT_SENALES_CONTRACCION"] = pd.to_numeric(z.get("CAT_SENALES_CONTRACCION", 0), errors="coerce").fillna(0).astype(int)
+        z[c]=_serie_numerica(z,c,0.0)
+    if "CAT_REGIMEN" not in z.columns:
+        z["CAT_REGIMEN"]="ESTABLE"
+    else:
+        z["CAT_REGIMEN"]=z["CAT_REGIMEN"].fillna("ESTABLE").astype(str)
+    if "CAT_SENALES_CONTRACCION" not in z.columns:
+        z["CAT_SENALES_CONTRACCION"]=0
+    else:
+        z["CAT_SENALES_CONTRACCION"]=_serie_numerica(z,"CAT_SENALES_CONTRACCION",0).astype(int)
     return z
 
 
@@ -544,7 +531,12 @@ def crear_features(df, objetivo):
     z["sin_mes"] = np.sin(2 * np.pi * z["MES_NUM"] / 12)
     z["cos_mes"] = np.cos(2 * np.pi * z["MES_NUM"] / 12)
     z["ANO"] = z["AÑO"]
-    z["REGISTRO_PRESENTE"] = pd.to_numeric(z.get("REGISTRO_PRESENTE", 1), errors="coerce").fillna(0)
+    if "REGISTRO_PRESENTE" not in z.columns:
+        z["REGISTRO_PRESENTE"] = 1.0
+    else:
+        z["REGISTRO_PRESENTE"] = pd.to_numeric(
+            z["REGISTRO_PRESENTE"], errors="coerce"
+        ).fillna(0.0)
     z["tendencia_3_12"] = np.where(
         z["mean12"].abs() > 1e-9, z["mean3"] / z["mean12"], 1.0
     )
@@ -591,8 +583,7 @@ def entrenar_objetivo(df, objetivo):
 
 
 @st.cache_resource(show_spinner=False)
-def entrenar_modelos(df):
-    df_modelo = anexar_features_categoria(df)
+def entrenar_modelos(df_modelo):
     return {
         objetivo: entrenar_objetivo(df_modelo, objetivo)
         for objetivo in ["VENTA", "UNIDADES", "PRECIO_PROMEDIO"]
@@ -621,7 +612,8 @@ def vector_futuro(historial, periodo, objetivo, medianas):
     fila["REGISTRO_PRESENTE"] = 0
     ultimo = hist.iloc[-1]
     for col in [c for c in NUM_FEATURES if c.startswith("CAT_")]:
-        fila[col] = float(pd.to_numeric(ultimo.get(col, 0.0), errors="coerce") or 0.0)
+        valor = pd.to_numeric(pd.Series([ultimo.get(col, 0.0)]), errors="coerce").fillna(0.0).iloc[0]
+        fila[col] = float(valor)
     fila["tendencia_3_12"] = (
         fila["mean3"] / fila["mean12"]
         if pd.notna(fila["mean12"]) and fila["mean12"] > 0
@@ -887,42 +879,30 @@ def forecast_categoria_mensual(df, categoria, periodo, metodo):
 
 
 def aplicar_control_regimen_categoria(forecast, df):
-    """Modera automáticamente crecimientos atípicos cuando hay contracción confirmada.
-
-    No usa factores manuales por categoría. El límite se obtiene de la última venta
-    comparable, el score causal y la amplitud de SKU cayendo. Nunca incrementa una
-    predicción; únicamente reduce excesos incompatibles con el régimen observado.
-    """
-    out = forecast.copy()
-    cat = crear_features_categoria_causales(df)
-    ultimo = (cat.sort_values("Periodo").groupby("CATEGORIA", as_index=False).tail(1)
-                [["CATEGORIA", "CAT_REGIMEN", "CAT_SCORE_CONTRACCION",
-                  "CAT_SENALES_CONTRACCION", "CAT_CREC_VOL_LFL_YOY",
-                  "CAT_CREC_VALOR_LFL_YOY", "CAT_PCT_SKU_CAYENDO_VOL", "CAT_VALOR_LAG1"]])
-    out = out.merge(ultimo, on="CATEGORIA", how="left")
-    out["Prediccion_antes_control_regimen"] = out["Prediccion_final"]
-    out["Factor_control_regimen"] = 1.0
-    out["Control_regimen_aplicado"] = False
-    for (cat_nombre, periodo), idx in out.groupby(["CATEGORIA", "Periodo"]).groups.items():
-        reg = str(out.loc[idx, "CAT_REGIMEN"].iloc[0])
-        senales = int(out.loc[idx, "CAT_SENALES_CONTRACCION"].fillna(0).iloc[0])
-        if reg not in {"DESACELERACION", "CONTRACCION", "CONTRACCION_SEVERA"} or senales < 2:
-            continue
-        total = out.loc[idx, "Prediccion_final"].sum()
-        referencia = float(out.loc[idx, "CAT_VALOR_LAG1"].fillna(0).iloc[0])
-        if total <= 0 or referencia <= 0:
-            continue
-        score = float(out.loc[idx, "CAT_SCORE_CONTRACCION"].fillna(0).iloc[0])
-        # Contracción severa admite menos crecimiento; desaceleración mantiene margen.
-        margen = {"DESACELERACION": 0.08, "CONTRACCION": 0.03,
-                  "CONTRACCION_SEVERA": 0.00}[reg]
-        ajuste_tendencia = float(np.clip(0.35 * score, -0.12, 0.03))
-        limite = referencia * max(0.75, 1.0 + margen + ajuste_tendencia)
-        if total > limite:
-            factor = float(np.clip(limite / total, 0.75, 1.0))
-            out.loc[idx, "Prediccion_final"] *= factor
-            out.loc[idx, "Factor_control_regimen"] = factor
-            out.loc[idx, "Control_regimen_aplicado"] = True
+    """Modera excesos solo cuando varias señales confirman contracción."""
+    out=forecast.copy()
+    cat=crear_features_categoria_causales(df)
+    cols=["CATEGORIA","CAT_REGIMEN","CAT_SCORE_CONTRACCION","CAT_SENALES_CONTRACCION","CAT_CREC_VOL_LFL_YOY","CAT_CREC_VALOR_LFL_YOY","CAT_PCT_SKU_CAYENDO_VOL","CAT_VALOR_LAG1"]
+    ultimo=cat.sort_values("Periodo").groupby("CATEGORIA",as_index=False).tail(1)[cols]
+    out=out.merge(ultimo,on="CATEGORIA",how="left",validate="many_to_one")
+    out["Prediccion_antes_control_regimen"]=out["Prediccion_final"]
+    out["Factor_control_regimen"]=1.0
+    out["Control_regimen_aplicado"]=False
+    for (_, _),idx in out.groupby(["CATEGORIA","Periodo"]).groups.items():
+        reg=str(out.loc[idx,"CAT_REGIMEN"].fillna("ESTABLE").iloc[0])
+        sen=int(_serie_numerica(out.loc[idx],"CAT_SENALES_CONTRACCION",0).iloc[0])
+        if reg not in {"DESACELERACION","CONTRACCION","CONTRACCION_SEVERA"} or sen<2: continue
+        total=float(out.loc[idx,"Prediccion_final"].sum())
+        ref=float(_serie_numerica(out.loc[idx],"CAT_VALOR_LAG1",0).iloc[0])
+        score=float(_serie_numerica(out.loc[idx],"CAT_SCORE_CONTRACCION",0).iloc[0])
+        if total<=0 or ref<=0: continue
+        margen={"DESACELERACION":.08,"CONTRACCION":.03,"CONTRACCION_SEVERA":0}[reg]
+        limite=ref*max(.75,1+margen+float(np.clip(.35*score,-.12,.03)))
+        if total>limite:
+            factor=float(np.clip(limite/total,.75,1.0))
+            out.loc[idx,"Prediccion_final"]*=factor
+            out.loc[idx,"Factor_control_regimen"]=factor
+            out.loc[idx,"Control_regimen_aplicado"]=True
     return out
 
 
@@ -1216,23 +1196,23 @@ if archivos:
         col_boton, col_estado = st.columns([1, 2])
         with col_boton:
             if st.button("Limpiar forecast anterior"):
-                st.session_state.pop("forecast_2026_mensual_jerarquico_v1", None)
+                st.session_state.pop("forecast_2026_mensual_jerarquico_v2_regimen", None)
                 st.cache_data.clear()
                 st.cache_resource.clear()
                 st.rerun()
         with col_estado:
-            st.info("Modelo v2 activo: señales internas LFL, detector causal de régimen, reconciliación SKU-categoría y sin calibraciones manuales.")
+            st.info("Modelo mensual jerárquico activo: backtesting por categoría, reconciliación SKU y sin calibraciones manuales.")
 
-        if "forecast_2026_mensual_jerarquico_v1" not in st.session_state:
+        if "forecast_2026_mensual_jerarquico_v2_regimen" not in st.session_state:
             st.info("Genera el forecast para habilitar la gráfica de noviembre-diciembre de 2026.")
 
         if st.button("Generar forecast mensual jerárquico Nov-Dic 2026", type="primary"):
             with st.spinner("Entrenando el modelo y generando el forecast..."):
-                st.session_state["forecast_2026_mensual_jerarquico_v1"] = generar_forecast(df)
+                st.session_state["forecast_2026_mensual_jerarquico_v2_regimen"] = generar_forecast(df)
             st.rerun()
 
-        if "forecast_2026_mensual_jerarquico_v1" in st.session_state:
-            forecast = st.session_state["forecast_2026_mensual_jerarquico_v1"]
+        if "forecast_2026_mensual_jerarquico_v2_regimen" in st.session_state:
+            forecast = st.session_state["forecast_2026_mensual_jerarquico_v2_regimen"]
             if forecast.empty:
                 st.error("No se encontraron SKU activos con datos recientes de 2026.")
                 st.stop()
@@ -1904,10 +1884,6 @@ if archivos:
                     "Ajuste_aplicado", "Prediccion_antes_calibracion",
                     "Factor_calibracion_categoria", "Calibracion_categoria_aplicada",
                     "Motivo_calibracion", "Prediccion_final",
-                    "CAT_REGIMEN", "CAT_SCORE_CONTRACCION", "CAT_SENALES_CONTRACCION",
-                    "CAT_CREC_VOL_LFL_YOY", "CAT_CREC_VALOR_LFL_YOY",
-                    "CAT_PCT_SKU_CAYENDO_VOL", "Prediccion_antes_control_regimen",
-                    "Factor_control_regimen", "Control_regimen_aplicado",
                 ]].copy()
                 resumen_categoria_v2 = (
                     diag.groupby("CATEGORIA", as_index=False)
@@ -1967,3 +1943,6 @@ if archivos:
         st.exception(error)
 else:
     st.info("Carga los tres archivos Excel para comenzar.")
+
+
+
